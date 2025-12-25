@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y \
     libavformat-dev \
     libavutil-dev \
     libswscale-dev \
+    libavfilter-dev \
+    libswresample-dev \
+    libavdevice-dev \
     libturbojpeg0-dev \
     pkg-config \
     clang \
