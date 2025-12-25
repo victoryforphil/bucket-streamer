@@ -176,7 +176,7 @@ Docker Host
 │  ┌─────────────────────────────────────────────────────────────┐   │
 │  │                      Session State                           │   │
 │  │  - Decoder context (persistent, flushed between seeks)      │   │
-│  │  - Current video path                                        │   │
+│  │  - Current video URL (s3:// or fs://)                        │   │
 │  │  - Frame request queue                                       │   │
 │  └─────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
@@ -414,7 +414,7 @@ pub enum ServerMessage {
 
 // pipeline/session.rs
 pub struct Session {
-    pub video_path: Option<String>,
+    pub video_url: Option<String>,
     pub decoder: Option<DecoderContext>,
     pub frame_queue: VecDeque<FrameRequest>,
 }
@@ -459,7 +459,7 @@ Client                                  Server
 // Set video source (required before requesting frames)
 {
     "type": "SetVideo",
-    "path": "videos/robot_cam_001.mp4"
+    "path": "s3://bucket/videos/robot_cam_001.h265"
 }
 
 // Request frames by byte offset
@@ -480,7 +480,7 @@ Client                                  Server
 // Video source acknowledged
 {
     "type": "VideoSet",
-    "path": "videos/robot_cam_001.mp4",
+    "path": "s3://bucket/videos/robot_cam_001.h265",
     "ok": true
 }
 
@@ -503,7 +503,7 @@ Client                                  Server
 // General error
 {
     "type": "Error",
-    "message": "Video not found: videos/missing.mp4"
+    "message": "Video not found: s3://bucket/missing.h265"
 }
 ```
 

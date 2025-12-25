@@ -4,6 +4,53 @@
 - Scalable across kubernetes clusters
 - Web client renderer
 
+# Storage URL Format
+
+Video files are referenced using URLs that specify both the storage backend and path:
+
+## Formats
+
+- **S3**: `s3://bucket-name/path/to/video.h265`
+- **Local filesystem**: `fs:///absolute/path/to/video.h265`
+
+## Usage
+
+- The `repo-cli convert` command generates these URLs in the offset JSON sidecar
+- The streaming server parses these URLs to determine which `object_store` backend to use
+- Clients send the URL in `SetVideo` messages to the streaming server
+
+## Examples
+
+```json
+// S3 hosted video
+{ "type": "SetVideo", "path": "s3://my-bucket/videos/clip001.h265" }
+
+// Local development
+{ "type": "SetVideo", "path": "fs:///workspace/data/clip001.h265" }
+```
+
+## Offset JSON Format
+
+The `repo-cli convert` command with `--extract-offsets` generates frame metadata:
+
+```json
+{
+  "video_url": "s3://my-bucket/videos/robot_cam.h265",
+  "frame_count": 150,
+  "iraps": [
+    {
+      "offset": 48,
+      "frames": [
+        { "offset": 48, "size": 12543, "index": 0, "is_keyframe": true },
+        { "offset": 12591, "size": 892, "index": 1, "is_keyframe": false }
+      ]
+    }
+  ]
+}
+```
+
+The `video_url` field contains the same URL format (S3 or fs://) that was used or specified during conversion.
+
 # Design Ideas
 - Use a WebSocket connection to maitain session support and routing 
     - Offers live back-and-forth channel 
