@@ -14,6 +14,7 @@ pub enum CliError {
     #[error("Output file already exists: {0} (use --force to overwrite)")]
     OutputExists(String),
 
+    #[allow(dead_code)]
     #[error("FFmpeg error: {0}")]
     FfmpegError(String),
 

@@ -15,11 +15,16 @@ use crate::error::CliError;
 
 #[derive(Args, Debug)]
 pub struct ConvertArgs {
-    /// Input video file path
+    /// Input: file path (single mode) or directory path (batch mode with -R)
     #[arg(short, long)]
     pub input: String,
 
-    /// Output file path (default: input with .h265 extension)
+    /// Enable recursive batch conversion of all .mp4 files in directory
+    #[arg(short = 'R', long)]
+    pub recursive: bool,
+
+    /// Output file path (single mode) or output directory (batch mode)
+    /// Default: single mode uses input.h265, batch mode uses input directory
     #[arg(short, long)]
     pub output: Option<String>,
 
@@ -82,6 +87,38 @@ struct FrameInfo {
 }
 
 //=============================================================================
+// Batch Processing Types
+//=============================================================================
+
+/// Result of a single file conversion in batch mode
+#[derive(Serialize, Clone)]
+struct BatchFileResult {
+    input: String,
+    output: Option<String>,
+    frame_count: Option<usize>,
+    status: BatchStatus,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "lowercase")]
+enum BatchStatus {
+    Success,
+    Failed,
+    Skipped,
+}
+
+/// Summary of batch conversion
+#[derive(Serialize)]
+struct BatchSummary {
+    total: usize,
+    successful: usize,
+    failed: usize,
+    skipped: usize,
+    results: Vec<BatchFileResult>,
+}
+
+//=============================================================================
 // Validation
 //=============================================================================
 
@@ -132,6 +169,53 @@ fn determine_storage_url(output_path: &str, provided: Option<&str>) -> Result<St
     let abs_path =
         std::fs::canonicalize(output_path).context("Failed to get absolute path for output")?;
     Ok(format!("fs://{}", abs_path.display()))
+}
+
+//=============================================================================
+// Batch Mode Validation
+//=============================================================================
+
+/// Validate batch mode: input must be a directory
+fn validate_batch_input(path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Err(CliError::FileNotFound(path.to_string()).into());
+    }
+    if !p.is_dir() {
+        return Err(CliError::InvalidInput(format!(
+            "Batch mode (-R) requires directory, got file: {}",
+            path
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Scan directory recursively for all .mp4 files
+fn find_mp4_files(dir: &str) -> Result<Vec<String>> {
+    let mut mp4_files = Vec::new();
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext.to_str() == Some("mp4") {
+                    mp4_files.push(path.to_string_lossy().to_string());
+                }
+            }
+        } else if path.is_dir() {
+            // Recursive scan
+            if let Some(path_str) = path.to_str() {
+                mp4_files.extend(find_mp4_files(path_str)?);
+            }
+        }
+    }
+
+    // Sort for consistent ordering
+    mp4_files.sort();
+    Ok(mp4_files)
 }
 
 //=============================================================================
@@ -414,24 +498,28 @@ fn create_progress_bar(global: &crate::GlobalOpts, estimated_frames: u64) -> Opt
 }
 
 //=============================================================================
-// Main Run Function
+// Single File Conversion
 //=============================================================================
 
-pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
+/// Convert a single file (used by both single and batch modes)
+async fn convert_single_file(
+    global: &crate::GlobalOpts,
+    input: &str,
+    output_path: &str,
+    extract_offsets: bool,
+    storage_url: Option<&str>,
+    force: bool,
+) -> Result<ConvertResult> {
     // Validate input file
-    validate_input(&args.input).context("Input validation failed")?;
-
-    // Determine output path
-    let output = args.output.unwrap_or_else(|| determine_output(&args.input));
+    validate_input(input).context("Input validation failed")?;
 
     // Check if output exists (before doing any work)
-    check_output_exists(&output, args.force)?;
+    check_output_exists(output_path, force)?;
 
     // Get estimated frame count for progress bar
-    // (Quick open just to get duration)
     let estimated_frames = {
         ffmpeg::init().ok();
-        ffmpeg::format::input(&args.input)
+        ffmpeg::format::input(input)
             .ok()
             .and_then(|ctx| {
                 let stream = ctx.streams().best(ffmpeg::media::Type::Video)?;
@@ -449,8 +537,8 @@ pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
     let pb = create_progress_bar(global, estimated_frames);
 
     // Clone paths for the blocking task
-    let input_clone = args.input.clone();
-    let output_clone = output.clone();
+    let input_clone = input.to_string();
+    let output_clone = output_path.to_string();
 
     // Create progress callback
     let pb_clone = pb.clone();
@@ -473,39 +561,233 @@ pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
     }
 
     // Extract offsets if requested
-    let offsets_file = if args.extract_offsets {
-        let offsets_path = format!("{}.offsets.json", output);
+    let offsets_file = if extract_offsets {
+        let offsets_path = format!("{}.offsets.json", output_path);
 
         // Get the actual storage URL (now that file exists, we can canonicalize)
-        let final_storage_url = determine_storage_url(&output, args.storage_url.as_deref())?;
+        let final_storage_url = determine_storage_url(output_path, storage_url)?;
 
-        extract_frame_offsets(&output, &final_storage_url, &offsets_path)?;
+        extract_frame_offsets(output_path, &final_storage_url, &offsets_path)?;
         Some(offsets_path)
     } else {
         None
     };
 
     // Build result
-    let final_storage_url = determine_storage_url(&output, args.storage_url.as_deref())?;
+    let final_storage_url = determine_storage_url(output_path, storage_url)?;
 
-    let result = ConvertResult {
-        input: args.input.clone(),
-        output: output.clone(),
+    Ok(ConvertResult {
+        input: input.to_string(),
+        output: output_path.to_string(),
         storage_url: final_storage_url,
         frame_count,
-        offsets_file: offsets_file.clone(),
-    };
+        offsets_file,
+    })
+}
 
-    // Output result
-    if global.json {
-        let output_data = CommandOutput::success(serde_json::to_value(&result)?);
+//=============================================================================
+// Batch Conversion
+//=============================================================================
+
+/// Run batch conversion on directory
+async fn run_batch(
+    global: &crate::GlobalOpts,
+    input_dir: &str,
+    output_dir: Option<&str>,
+    extract_offsets: bool,
+    storage_url: Option<&str>,
+    force: bool,
+) -> Result<BatchSummary> {
+    // Find all .mp4 files
+    let mp4_files = find_mp4_files(input_dir)?;
+
+    if mp4_files.is_empty() {
+        println!("No .mp4 files found in directory: {}", input_dir);
+        return Ok(BatchSummary {
+            total: 0,
+            successful: 0,
+            failed: 0,
+            skipped: 0,
+            results: vec![],
+        });
+    }
+
+    let total_files = mp4_files.len();
+    println!("Found {} .mp4 file(s) to convert\n", total_files);
+
+    let mut results = Vec::new();
+    let mut successful = 0;
+    let mut failed = 0;
+    let mut skipped = 0;
+
+    // Determine output directory
+    let out_dir = output_dir.unwrap_or(input_dir);
+
+    for (idx, input_file) in mp4_files.iter().enumerate() {
+        println!("[{}/{}] Converting: {}", idx + 1, total_files, input_file);
+
+        // Determine output path for this file
+        let output_path = Path::new(input_file)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| {
+                Path::new(out_dir)
+                    .join(name)
+                    .with_extension("h265")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap();
+
+        // Check if output exists (skip unless --force)
+        if Path::new(&output_path).exists() && !force {
+            println!("  ⏭ Skipped (output exists, use --force to overwrite)\n");
+            results.push(BatchFileResult {
+                input: input_file.clone(),
+                output: Some(output_path),
+                frame_count: None,
+                status: BatchStatus::Skipped,
+                error: Some("Output file exists".to_string()),
+            });
+            skipped += 1;
+            continue;
+        }
+
+        // Convert the file
+        match convert_single_file(
+            global,
+            input_file,
+            &output_path,
+            extract_offsets,
+            storage_url,
+            force,
+        )
+        .await
+        {
+            Ok(result) => {
+                println!("  ✓ Success: {} frames\n", result.frame_count);
+                results.push(BatchFileResult {
+                    input: input_file.clone(),
+                    output: Some(result.output),
+                    frame_count: Some(result.frame_count),
+                    status: BatchStatus::Success,
+                    error: None,
+                });
+                successful += 1;
+            }
+            Err(e) => {
+                println!("  ✗ Failed: {}\n", e);
+                results.push(BatchFileResult {
+                    input: input_file.clone(),
+                    output: None,
+                    frame_count: None,
+                    status: BatchStatus::Failed,
+                    error: Some(e.to_string()),
+                });
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(BatchSummary {
+        total: total_files,
+        successful,
+        failed,
+        skipped,
+        results,
+    })
+}
+
+/// Print batch conversion summary
+fn print_batch_summary(summary: &BatchSummary, json_output: bool) -> Result<()> {
+    if json_output {
+        let output_data = CommandOutput::success(serde_json::to_value(summary)?);
         println!("{}", serde_json::to_string_pretty(&output_data)?);
     } else {
-        println!("Converted: {} -> {}", result.input, result.output);
-        println!("  Frames: {}", result.frame_count);
-        println!("  Storage URL: {}", result.storage_url);
-        if let Some(ref offsets) = result.offsets_file {
-            println!("  Offsets: {}", offsets);
+        println!("╔════════════════════════════════════════════════════════════╗");
+        println!("║              BATCH CONVERSION COMPLETE                     ║");
+        println!("╠════════════════════════════════════════════════════════════╣");
+        println!(
+            "║ Total Files:     {:>5}                                     ║",
+            summary.total
+        );
+        println!(
+            "║ Successful:      {:>5} ✓                                  ║",
+            summary.successful
+        );
+        println!(
+            "║ Failed:          {:>5} ✗                                  ║",
+            summary.failed
+        );
+        println!(
+            "║ Skipped:         {:>5} ⏭                                   ║",
+            summary.skipped
+        );
+        println!("╚════════════════════════════════════════════════════════════╝");
+
+        // Show failed files if any
+        if summary.failed > 0 {
+            println!("\nFailed conversions:");
+            for result in &summary.results {
+                if matches!(result.status, BatchStatus::Failed) {
+                    println!("  ✗ {}", result.input);
+                    if let Some(ref err) = result.error {
+                        println!("    Error: {}", err);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+//=============================================================================
+// Main Run Function
+//=============================================================================
+
+pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
+    if args.recursive {
+        // Batch mode
+        validate_batch_input(&args.input)?;
+
+        let summary = run_batch(
+            global,
+            &args.input,
+            args.output.as_deref(),
+            args.extract_offsets,
+            args.storage_url.as_deref(),
+            args.force,
+        )
+        .await?;
+
+        // Print batch summary
+        print_batch_summary(&summary, global.json)?;
+    } else {
+        // Single file mode (existing behavior)
+        let output = args.output.unwrap_or_else(|| determine_output(&args.input));
+
+        let result = convert_single_file(
+            global,
+            &args.input,
+            &output,
+            args.extract_offsets,
+            args.storage_url.as_deref(),
+            args.force,
+        )
+        .await?;
+
+        // Output result
+        if global.json {
+            let output_data = CommandOutput::success(serde_json::to_value(&result)?);
+            println!("{}", serde_json::to_string_pretty(&output_data)?);
+        } else {
+            println!("Converted: {} -> {}", result.input, result.output);
+            println!("  Frames: {}", result.frame_count);
+            println!("  Storage URL: {}", result.storage_url);
+            if let Some(ref offsets) = result.offsets_file {
+                println!("  Offsets: {}", offsets);
+            }
         }
     }
 
