@@ -52,6 +52,84 @@
     - Stream server sends frames to the session as they are converted.
         - In the future we should check a cache first (spread this as wide as possible)
 
+# Kubernetes / Cluster Supper
+- Will need to run in a kubernetes cluster 
+- This introducing load balancing challenges
+- Need a way to test easily locally and simulate
+    - minik8s or similar like system in a docker container?
+    - nginx routing or similar will be needed.
 
 
-        
+# Components
+- Streaming Server
+    - Main binary / single process for the streaming server
+    - Operates the websocket server and connection pull
+    - Runs in its container by it self in a pod
+    - Main unit in caching 
+    - Has main async event loop that runs our event queue and tasks
+    - Channels:
+        - Represents a given video track and related decoder and caches
+        - Can be seperated out from websocket to allow different WS sessions to share compute.
+- Streaming CLI
+    - Mimimal CLI wraper to connect to Streaming server
+    - Implements a Web socket client
+    - Used to benchmark 
+- Repo CLI
+    - Helper CLI for common tasks
+    - Can add utils like the h265 prep - benchmarking, docker commands etc.
+- Mock S3 
+    - Something that can be launch in docker / compose / kubernetes
+# Technology Selection
+- Streaming Server
+    - Rust
+    - Tokio for the async / threading
+    - Axum / Axtix / Tokiop Tungstenite (needs research)
+    - invokes ffmpeg (`ffmpeg-sys`) 
+- Mock S3 
+    - Seaweed FS strong choice
+    - MinIo-like but hopefully something better exists
+    - WebDashboard included (like minio) strong benefit (for uploading content)
+        - If not a big deal, we can add it to our Repo CLI
+- Repo CLI
+    - Rust + Clap
+    - Open to other CLI / TUI frameowrks
+    - Ratatui for TUI 
+- Streaming CLI
+    - Rust + Clap
+
+# Server Layout
+- Server Binary
+    - Web Socket Server
+        - Websocket Connection->Session
+    - Channels (per clip)
+        - Decoder
+        - VideoHeader?
+        - Clips
+            - status
+                - REGISTERED
+                - DECODED
+            - irap_byte
+            - frames
+                - byte_offset
+                - frame_index
+                - timestamps?
+                - jpeg_data
+    - Pipeline (tasks)
+        - WS Listener
+            - Connected to the Websocket server / sessions
+            - Listens for events from client and shares with pipeline
+            - WS//REGISTER_CHANNEL -> INT//SPAWN_CHANNEL
+                - Sent per video clip that we discover and want to most likely start processing on 
+            - WS//REGISTER_CLIP -> INT//SPAWN_CLIP + INT//DECODE_CLIP
+                - Send per IRAP segment found
+                - Causes a clip spawn via the Clip spawner
+                - Will also invoke a render clip call if 
+            - WS//REQUEST_FRAME
+                - Sent anytime the client wishes to get some frames back
+                - LIFO queue - respond to latest request first ideally.
+                - 
+        - Channel Spawner
+        - Clip Spawner
+        - Clip Decoder
+        - Clip Encoder
+        - WS Sender
