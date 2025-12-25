@@ -149,7 +149,7 @@ async fn handle_session(socket: WebSocket, _state: AppState) {
                         let response = handle_message(client_msg, &mut video_path).await;
                         let json = response.to_json();
 
-                        if sender.send(Message::Text(json)).await.is_err() {
+                        if sender.send(Message::text(json)).await.is_err() {
                             error!("Failed to send response");
                             break;
                         }
@@ -158,7 +158,7 @@ async fn handle_session(socket: WebSocket, _state: AppState) {
                         let error_msg = ServerMessage::Error {
                             message: format!("Invalid message: {}", e),
                         };
-                        if sender.send(Message::Text(error_msg.to_json())).await.is_err() {
+                        if sender.send(Message::text(error_msg.to_json())).await.is_err() {
                             break;
                         }
                     }
@@ -304,7 +304,7 @@ pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
 - `SinkExt::send()` - send message
 
 ### Message Type
-In Axum 0.7, `Message::Text(String)` contains a `String` directly. No conversion needed when sending JSON strings.
+In Axum 0.7.9+, `Message::Text(Utf8Bytes)` contains `Utf8Bytes`, not `String`. Use `Message::text(s)` helper for sending text, which accepts any stringable type. When receiving, `Utf8Bytes` can be used like a string via `Deref<Target=str>`.
 
 ### State Sharing
 `AppState` is cloned into each handler. Use `Arc<T>` for expensive-to-clone data:
