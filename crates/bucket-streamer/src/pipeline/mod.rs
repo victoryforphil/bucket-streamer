@@ -1,3 +1,4 @@
+pub mod avio;
 pub mod decoder;
 pub mod encoder;
 pub mod fetcher;
