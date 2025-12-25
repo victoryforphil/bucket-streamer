@@ -1,0 +1,7 @@
+#!/bin/bash
+# repo-cli helper script - forwards all arguments to cargo run -p repo-cli
+# Works from anywhere in the repo directory tree
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+cargo run -p repo-cli -- "$@"
