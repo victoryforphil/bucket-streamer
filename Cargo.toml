@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/bucket-streamer",
+  "crates/streaming-cli",
+  "crates/repo-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+object_store = { version = "0.11", features = ["aws"] }
+bytes = "1"
+ffmpeg-next = "7"
+ffmpeg-sys-next = "7"
+turbojpeg = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = "0.26"
+indicatif = "0.17"
