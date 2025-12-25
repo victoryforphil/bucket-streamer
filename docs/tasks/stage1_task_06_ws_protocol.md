@@ -31,7 +31,7 @@ pub use protocol::{ClientMessage, ServerMessage, FrameRequest};
 use serde::{Deserialize, Serialize};
 
 /// Messages sent from client to server
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
     /// Set the video source for this session
@@ -47,7 +47,7 @@ pub enum ClientMessage {
 }
 
 /// Individual frame request within a RequestFrames message
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FrameRequest {
     /// Byte offset of the frame in the video file
     pub offset: u64,
@@ -56,7 +56,7 @@ pub struct FrameRequest {
 }
 
 /// Messages sent from server to client
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
     /// Acknowledgment of SetVideo
@@ -194,7 +194,7 @@ mod tests {
 - [ ] Round-trip JSON parsing works for all types
 - [ ] Invalid JSON returns parse error (not panic)
 - [ ] Unknown message types return parse error
-- [ ] All tests pass: `cargo test -p bucket-streamer protocol`
+- [ ] All tests pass: `cargo test -p bucket-streamer -- protocol`
 
 ## Context
 
