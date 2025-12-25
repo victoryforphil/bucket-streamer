@@ -12,10 +12,7 @@ use super::protocol::{ClientMessage, ServerMessage};
 use super::router::AppState;
 
 /// WebSocket upgrade handler
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_session(socket, state))
 }
 
@@ -55,7 +52,11 @@ async fn handle_session(socket: WebSocket, _state: AppState) {
                         let error_msg = ServerMessage::Error {
                             message: format!("Invalid message: {}", e),
                         };
-                        if sender.send(Message::Text(error_msg.to_json().into())).await.is_err() {
+                        if sender
+                            .send(Message::Text(error_msg.to_json().into()))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -89,7 +90,10 @@ async fn handle_message(msg: ClientMessage, video_path: &mut Option<String>) -> 
             // Video validation added in Task 11
             ServerMessage::VideoSet { path, ok: true }
         }
-        ClientMessage::RequestFrames { irap_offset, frames } => {
+        ClientMessage::RequestFrames {
+            irap_offset,
+            frames,
+        } => {
             if video_path.is_none() {
                 return ServerMessage::Error {
                     message: "No video set. Send SetVideo first.".to_string(),
