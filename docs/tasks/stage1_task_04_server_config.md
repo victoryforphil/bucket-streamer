@@ -18,8 +18,15 @@ crates/bucket-streamer/src/main.rs      # Wire up config parsing
 ### 1. Implement config.rs
 
 ```rust
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    Local,
+    S3,
+}
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 #[command(name = "bucket-streamer")]
@@ -32,7 +39,7 @@ pub struct Config {
 
     /// Storage backend: "local" or "s3"
     #[arg(long, env = "STORAGE_BACKEND", default_value = "local")]
-    pub storage_backend: String,
+    pub storage_backend: StorageBackend,
 
     /// Local storage path (when using local backend)
     #[arg(long, env = "LOCAL_PATH", default_value = "./data")]
@@ -49,6 +56,14 @@ pub struct Config {
     /// S3 endpoint URL (for MinIO or custom S3)
     #[arg(long, env = "S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
+
+    /// S3 access key (for MinIO or explicit credentials)
+    #[arg(long, env = "S3_ACCESS_KEY", default_value = "minioadmin")]
+    pub s3_access_key: String,
+
+    /// S3 secret key (for MinIO or explicit credentials)
+    #[arg(long, env = "S3_SECRET_KEY", default_value = "minioadmin")]
+    pub s3_secret_key: String,
 
     /// JPEG encoding quality (1-100)
     #[arg(long, env = "JPEG_QUALITY", default_value = "80")]
@@ -67,11 +82,7 @@ impl Config {
 
     /// Validate configuration values
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.jpeg_quality == 0 || self.jpeg_quality > 100 {
-            return Err(ConfigError::InvalidJpegQuality(self.jpeg_quality));
-        }
-
-        if self.storage_backend == "s3" && self.s3_bucket.is_empty() {
+        if self.storage_backend == StorageBackend::S3 && self.s3_bucket.is_empty() {
             return Err(ConfigError::MissingS3Bucket);
         }
 
@@ -79,11 +90,25 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen_addr: "0.0.0.0:3000".to_string(),
+            storage_backend: StorageBackend::Local,
+            local_path: "./data".to_string(),
+            s3_bucket: "".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_endpoint: None,
+            s3_access_key: "minioadmin".to_string(),
+            s3_secret_key: "minioadmin".to_string(),
+            jpeg_quality: 80,
+            log_level: "info".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("JPEG quality must be 1-100, got {0}")]
-    InvalidJpegQuality(u8),
-
     #[error("S3 bucket name required when using s3 backend")]
     MissingS3Bucket,
 }
@@ -132,54 +157,24 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let config = Config {
-            listen_addr: "0.0.0.0:3000".to_string(),
-            storage_backend: "local".to_string(),
-            local_path: "./data".to_string(),
-            s3_bucket: "".to_string(),
-            s3_region: "us-east-1".to_string(),
-            s3_endpoint: None,
-            jpeg_quality: 80,
-            log_level: "info".to_string(),
-        };
+        let config = Config::default();
         assert!(config.validate().is_ok());
     }
 
     #[test]
-    fn test_invalid_jpeg_quality() {
-        let config = Config {
-            jpeg_quality: 0,
-            ..Default::default()
-        };
+    fn test_s3_requires_bucket() {
+        let mut config = Config::default();
+        config.storage_backend = StorageBackend::S3;
+        config.s3_bucket = "".to_string();
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn test_s3_requires_bucket() {
-        let config = Config {
-            storage_backend: "s3".to_string(),
-            s3_bucket: "".to_string(),
-            ..Default::default()
-        };
-        assert!(config.validate().is_err());
-    }
-}
-```
-
-For tests, implement Default:
-```rust
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            listen_addr: "0.0.0.0:3000".to_string(),
-            storage_backend: "local".to_string(),
-            local_path: "./data".to_string(),
-            s3_bucket: "".to_string(),
-            s3_region: "us-east-1".to_string(),
-            s3_endpoint: None,
-            jpeg_quality: 80,
-            log_level: "info".to_string(),
-        }
+    fn test_s3_with_bucket_valid() {
+        let mut config = Config::default();
+        config.storage_backend = StorageBackend::S3;
+        config.s3_bucket = "my-bucket".to_string();
+        assert!(config.validate().is_ok());
     }
 }
 ```
@@ -189,8 +184,7 @@ impl Default for Config {
 - [ ] `cargo run -p bucket-streamer -- --help` shows all options
 - [ ] Default values work without any args
 - [ ] Environment variables override defaults: `LISTEN_ADDR=:8080 cargo run -p bucket-streamer`
-- [ ] CLI args override environment: `LISTEN_ADDR=:8080 cargo run -- --listen-addr :9000`
-- [ ] Invalid jpeg_quality (0 or >100) returns error
+- [ ] CLI args override environment: `LISTEN_ADDR=:8080 cargo run -p bucket-streamer -- --listen-addr :9000`
 - [ ] S3 backend without bucket returns error
 - [ ] `cargo test -p bucket-streamer` passes
 
@@ -199,10 +193,16 @@ impl Default for Config {
 ### Clap + Environment Variables
 Using `#[arg(env = "...")]` enables automatic environment variable fallback. Priority: CLI arg > env var > default.
 
+### StorageBackend Enum
+Using `ValueEnum` derive allows Clap to parse string values ("local", "s3") into typed enum variants. Combined with `serde(rename_all = "lowercase")`, serialization is consistent.
+
 ### Why Serde on Config?
 - Future: load config from TOML/JSON file
 - Debug: serialize config to logs
 - Testing: easy construction in tests
+
+### S3 Credentials
+Default credentials are set to MinIO defaults (`minioadmin`/`minioadmin`) for local development. In production, override via environment variables or CLI args.
 
 ### S3 Endpoint Option
 The `s3_endpoint` field supports MinIO and other S3-compatible services:
