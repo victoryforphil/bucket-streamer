@@ -5,7 +5,7 @@ use ffmpeg_next::packet::Mut as _;
 use ffmpeg_next::software::scaling::{Context as ScalerContext, Flags};
 use ffmpeg_sys_next::{self as ffi, AVFormatContext};
 
-use super::avio::{AvioContext, AvioError, open_format_context};
+use super::avio::{open_format_context, AvioContext, AvioError};
 
 /// Decoded video frame ready for JPEG encoding
 #[derive(Debug, Clone)]
@@ -55,49 +55,37 @@ pub enum DecoderError {
     #[error("Failed to initialize scaler")]
     ScalerInit,
 
-    #[error("Frame index {index} not found (GOP contains {total} frames)")]
-    FrameNotFound { index: u32, total: u32 },
+    #[error("Frame at offset {0} not found")]
+    FrameNotFound(u64),
 
     #[error("Decode failed: {0}")]
     DecodeError(String),
 
     #[error("Send packet failed: {0}")]
     SendPacket(String),
-
-    #[error("Receive frame failed: {0}")]
-    ReceiveFrame(String),
-
-    #[error("Format context error: {0}")]
-    FormatContext(String),
 }
 
-/// H.265 decoder with persistent context
+/// H.265 decoder with persistent codec context
 ///
-/// The decoder maintains FFmpeg codec context across multiple decode calls.
-/// For each GOP, a new format context is created but the codec state is reused.
+/// Decodes frames by byte offset, matching the protocol's addressing scheme.
+/// The decoder maintains FFmpeg codec context across multiple decode calls
+/// for efficiency.
 ///
 /// # Usage
 /// ```ignore
-/// let decoder = Decoder::new(&initial_video_sample)?;
-/// 
-/// // Decode specific frames from a GOP
-/// let frames = decoder.decode_frames(&gop_data, &[0, 2, 4])?;
-/// 
-/// // Or decode all frames
-/// let all_frames = decoder.decode_all_frames(&gop_data)?;
+/// let decoder = Decoder::new(&video_data)?;
+///
+/// // Decode frame at specific byte offset
+/// let frame = decoder.decode_frame(&video_data, 12591)?;
 /// ```
 ///
 /// # Thread Safety
 /// `Decoder` is not `Send`/`Sync` due to FFmpeg internals. For async usage,
 /// wrap decode calls in `tokio::task::spawn_blocking`.
 pub struct Decoder {
-    /// Video stream index in container
     video_stream_index: usize,
-    /// FFmpeg video decoder (persistent)
     decoder: ffmpeg::decoder::Video,
-    /// YUV420P scaler (initialized upfront)
     scaler: ScalerContext,
-    /// Video dimensions
     width: u32,
     height: u32,
 }
@@ -105,12 +93,8 @@ pub struct Decoder {
 impl Decoder {
     /// Create decoder by probing video data to detect format
     ///
-    /// The `initial_data` is used to detect video format, dimensions,
-    /// and initialize the decoder and scaler. This can be a small sample
-    /// or the complete video file.
-    ///
     /// # Arguments
-    /// * `initial_data` - Valid MP4 data to probe for codec parameters
+    /// * `initial_data` - Valid H.265 MP4 data to probe for codec parameters
     ///
     /// # Errors
     /// Returns error if FFmpeg init fails, no video stream found, or
@@ -123,25 +107,20 @@ impl Decoder {
         unsafe {
             let fmt_ctx = open_format_context(&mut avio)?;
 
-            // Find video stream
             let (stream_index, codecpar) = Self::find_video_stream(fmt_ctx)?;
 
-            // Create decoder
             let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC)
                 .ok_or(DecoderError::DecoderNotFound)?;
 
             let mut decoder_ctx = ffmpeg::codec::Context::new_with_codec(codec);
 
-            // Copy codec parameters to decoder context
-            let ret = ffi::avcodec_parameters_to_context(
-                decoder_ctx.as_mut_ptr(),
-                codecpar,
-            );
+            let ret = ffi::avcodec_parameters_to_context(decoder_ctx.as_mut_ptr(), codecpar);
             if ret < 0 {
                 ffi::avformat_close_input(&mut (fmt_ctx as *mut _));
-                return Err(DecoderError::DecoderOpen(
-                    format!("avcodec_parameters_to_context failed: {}", ret)
-                ));
+                return Err(DecoderError::DecoderOpen(format!(
+                    "avcodec_parameters_to_context failed: {}",
+                    ret
+                )));
             }
 
             let decoder = decoder_ctx
@@ -153,10 +132,8 @@ impl Decoder {
             let height = decoder.height();
             let format = decoder.format();
 
-            // Clean up format context (decoder is independent now)
             ffi::avformat_close_input(&mut (fmt_ctx as *mut _));
 
-            // Initialize scaler upfront for YUV420P output
             let scaler = ScalerContext::get(
                 format,
                 width,
@@ -178,7 +155,6 @@ impl Decoder {
         }
     }
 
-    /// Find video stream in format context
     unsafe fn find_video_stream(
         fmt_ctx: *mut AVFormatContext,
     ) -> Result<(usize, *const ffi::AVCodecParameters), DecoderError> {
@@ -192,138 +168,102 @@ impl Decoder {
         Err(DecoderError::NoVideoStream)
     }
 
-    /// Decode specific frames from a GOP byte range
+    /// Decode a single frame at the given byte offset
+    ///
+    /// Decodes sequentially from the start of the video data until
+    /// reaching the packet at `target_offset`. H.265 requires sequential
+    /// decoding from the nearest IRAP (keyframe).
     ///
     /// # Arguments
-    /// * `gop_data` - Valid MP4 structure containing headers + GOP data
-    /// * `frame_indices` - Relative indices within the GOP (0 = IRAP keyframe)
+    /// * `video_data` - Video file data (should start from IRAP for correct decoding)
+    /// * `target_offset` - Byte offset of the target frame in the original file
     ///
     /// # Returns
-    /// Vector of decoded frames in the order requested.
+    /// The decoded frame at `target_offset` in YUV420P format.
     ///
     /// # Errors
-    /// Returns error if any requested frame index is not found in the GOP.
+    /// Returns `FrameNotFound` if no packet matches the target offset.
     ///
-    /// # Example
-    /// ```ignore
-    /// // Decode keyframe and frames 2, 4 from a GOP
-    /// let frames = decoder.decode_frames(&gop_bytes, &[0, 2, 4])?;
-    /// assert_eq!(frames.len(), 3);
-    /// ```
-    pub fn decode_frames(
+    /// # Note
+    /// For optimal performance, `video_data` should contain only the GOP
+    /// starting from the relevant IRAP. The `target_offset` should match
+    /// a packet position within that data.
+    pub fn decode_frame(
         &mut self,
-        gop_data: &Bytes,
-        frame_indices: &[u32],
-    ) -> Result<Vec<DecodedFrame>, DecoderError> {
-        if frame_indices.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Find the maximum frame index we need to decode up to
-        let max_index = *frame_indices.iter().max().unwrap();
-
-        // Decode all frames up to max_index
-        let all_frames = self.decode_up_to(gop_data, max_index)?;
-
-        // Extract requested frames in order
-        let mut result = Vec::with_capacity(frame_indices.len());
-        for &idx in frame_indices {
-            let frame = all_frames
-                .get(idx as usize)
-                .cloned()
-                .ok_or(DecoderError::FrameNotFound {
-                    index: idx,
-                    total: all_frames.len() as u32,
-                })?;
-            result.push(frame);
-        }
-
-        Ok(result)
-    }
-
-    /// Decode all frames in a GOP
-    ///
-    /// # Arguments
-    /// * `gop_data` - Valid MP4 structure containing headers + GOP data
-    ///
-    /// # Returns
-    /// All decoded frames in decode order (frame 0 = IRAP).
-    pub fn decode_all_frames(
-        &mut self,
-        gop_data: &Bytes,
-    ) -> Result<Vec<DecodedFrame>, DecoderError> {
-        self.decode_up_to(gop_data, u32::MAX)
-    }
-
-    /// Decode frames from GOP up to (and including) max_index
-    fn decode_up_to(
-        &mut self,
-        gop_data: &Bytes,
-        max_index: u32,
-    ) -> Result<Vec<DecodedFrame>, DecoderError> {
-        // Always flush before decoding new GOP
+        video_data: &Bytes,
+        target_offset: u64,
+    ) -> Result<DecodedFrame, DecoderError> {
         self.decoder.flush();
 
-        let mut avio = AvioContext::new(gop_data.clone())?;
+        let mut avio = AvioContext::new(video_data.clone())?;
 
         unsafe {
             let fmt_ctx = open_format_context(&mut avio)?;
 
-            let mut decoded_frames = Vec::new();
             let mut packet = ffmpeg::Packet::empty();
             let mut frame = ffmpeg::frame::Video::empty();
-            let mut current_index: u32 = 0;
+            let mut target_frame: Option<DecodedFrame> = None;
 
-            // Read and decode packets
+            // Track which packet positions have been decoded
+            let mut last_decoded_offset: Option<u64> = None;
+
             while ffi::av_read_frame(fmt_ctx, packet.as_mut_ptr()) >= 0 {
-                // Skip non-video streams
                 if packet.stream() != self.video_stream_index {
-                    packet.rescale_ts(
-                        ffmpeg::Rational::new(1, 1),
-                        ffmpeg::Rational::new(1, 1),
-                    );
+                    packet.rescale_ts(ffmpeg::Rational::new(1, 1), ffmpeg::Rational::new(1, 1));
                     continue;
                 }
 
-                // Send packet to decoder
+                let packet_offset = packet.position();
+                let is_target = packet_offset >= 0 && packet_offset as u64 == target_offset;
+
                 self.decoder
                     .send_packet(&packet)
                     .map_err(|e| DecoderError::SendPacket(e.to_string()))?;
 
-                // Receive all available frames
+                // Receive decoded frames
                 while self.decoder.receive_frame(&mut frame).is_ok() {
-                    let decoded = self.convert_frame(&frame)?;
-                    decoded_frames.push(decoded);
-
-                    current_index += 1;
-                    if current_index > max_index {
-                        ffi::avformat_close_input(&mut (fmt_ctx as *mut _));
-                        return Ok(decoded_frames);
+                    // If this frame corresponds to our target packet
+                    if is_target || last_decoded_offset == Some(target_offset) {
+                        let decoded = self.convert_frame(&frame)?;
+                        target_frame = Some(decoded);
                     }
+                    last_decoded_offset = if packet_offset >= 0 {
+                        Some(packet_offset as u64)
+                    } else {
+                        None
+                    };
+                }
+
+                // Early exit if we found our target
+                if target_frame.is_some() {
+                    ffi::avformat_close_input(&mut (fmt_ctx as *mut _));
+                    return Ok(target_frame.unwrap());
+                }
+
+                if is_target {
+                    last_decoded_offset = Some(target_offset);
                 }
             }
 
-            // Flush decoder to get any remaining frames
+            // Flush decoder for remaining frames
             self.decoder
                 .send_eof()
                 .map_err(|e| DecoderError::SendPacket(e.to_string()))?;
 
             while self.decoder.receive_frame(&mut frame).is_ok() {
-                let decoded = self.convert_frame(&frame)?;
-                decoded_frames.push(decoded);
-
-                current_index += 1;
-                if current_index > max_index {
+                if last_decoded_offset == Some(target_offset) {
+                    let decoded = self.convert_frame(&frame)?;
+                    target_frame = Some(decoded);
                     break;
                 }
             }
 
             ffi::avformat_close_input(&mut (fmt_ctx as *mut _));
-            Ok(decoded_frames)
+
+            target_frame.ok_or(DecoderError::FrameNotFound(target_offset))
         }
     }
 
-    /// Convert FFmpeg frame to DecodedFrame (YUV420P)
     fn convert_frame(
         &mut self,
         frame: &ffmpeg::frame::Video,
@@ -333,7 +273,6 @@ impl Decoder {
             .run(frame, &mut output)
             .map_err(|e| DecoderError::DecodeError(e.to_string()))?;
 
-        // Copy YUV planes to contiguous buffer
         let y_size = (self.width * self.height) as usize;
         let uv_size = y_size / 4;
         let mut data = Vec::with_capacity(y_size + 2 * uv_size);
@@ -374,10 +313,7 @@ impl Decoder {
         })
     }
 
-    /// Flush decoder state
-    ///
-    /// Called automatically between GOP decodes, but can be called
-    /// manually if needed.
+    /// Flush decoder state (called automatically by decode_frame)
     pub fn flush(&mut self) {
         self.decoder.flush();
     }
@@ -417,16 +353,56 @@ mod tests {
             .unwrap_or_else(|| "data/test.h265.mp4".to_string());
 
         Bytes::from(
-            std::fs::read(&path)
-                .expect("Test video not found. Run: repo-cli convert -i <video> -o data/test.h265.mp4"),
+            std::fs::read(&path).expect(
+                "Test video not found. Run: repo-cli convert -i <video> -o data/test.h265.mp4",
+            ),
         )
+    }
+
+    /// Helper to get first frame offset from test video
+    fn get_first_frame_offset() -> u64 {
+        use ffmpeg_next as ffmpeg;
+        ffmpeg::init().unwrap();
+
+        let path = std::env::var("TEST_VIDEO_PATH").unwrap_or_else(|_| {
+            let possible = vec![
+                "data/test.h265.mp4",
+                "../../../data/test.h265.mp4",
+                "../../data/test.h265.mp4",
+            ];
+            for p in possible {
+                if std::path::Path::new(p).exists() {
+                    return p.to_string();
+                }
+            }
+            "data/test.h265.mp4".to_string()
+        });
+
+        let ictx = ffmpeg::format::input(&path).unwrap();
+        let video_stream = ictx.streams().best(ffmpeg::media::Type::Video).unwrap();
+        let stream_idx = video_stream.index();
+
+        let mut ictx = ffmpeg::format::input(&path).unwrap();
+        for (stream, packet) in ictx.packets() {
+            if stream.index() == stream_idx {
+                let pos = packet.position();
+                if pos >= 0 {
+                    return pos as u64;
+                }
+            }
+        }
+        panic!("No video packets found");
     }
 
     #[test]
     fn test_decoder_creation() {
         let data = load_test_video();
         let decoder = Decoder::new(&data);
-        assert!(decoder.is_ok(), "Decoder creation failed: {:?}", decoder.err());
+        assert!(
+            decoder.is_ok(),
+            "Decoder creation failed: {:?}",
+            decoder.err()
+        );
 
         let decoder = decoder.unwrap();
         assert!(decoder.width() > 0, "Width should be > 0");
@@ -434,14 +410,15 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_first_frame() {
+    fn test_decode_frame_by_offset() {
         let data = load_test_video();
+        let first_offset = get_first_frame_offset();
+
         let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
+        let frame = decoder.decode_frame(&data, first_offset);
 
-        let frames = decoder.decode_frames(&data, &[0]).expect("Decode failed");
-
-        assert_eq!(frames.len(), 1);
-        let frame = &frames[0];
+        assert!(frame.is_ok(), "Decode failed: {:?}", frame.err());
+        let frame = frame.unwrap();
         assert_eq!(frame.width, decoder.width());
         assert_eq!(frame.height, decoder.height());
         assert!(!frame.data.is_empty());
@@ -452,83 +429,51 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_multiple_frames() {
-        let data = load_test_video();
-        let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
-
-        // Decode frames 0, 2, 4
-        let indices = [0, 2, 4];
-        let frames = decoder.decode_frames(&data, &indices);
-
-        assert!(frames.is_ok(), "Failed to decode frames: {:?}", frames.err());
-        let frames = frames.unwrap();
-        assert_eq!(frames.len(), indices.len());
-    }
-
-    #[test]
-    fn test_decode_all_frames() {
-        let data = load_test_video();
-        let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
-
-        let frames = decoder.decode_all_frames(&data);
-        assert!(frames.is_ok(), "Failed to decode all frames: {:?}", frames.err());
-
-        let frames = frames.unwrap();
-        assert!(!frames.is_empty(), "Should decode at least one frame");
-        println!("Decoded {} frames", frames.len());
-    }
-
-    #[test]
-    fn test_decoder_reuse() {
-        let data = load_test_video();
-        let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
-
-        // Decode first GOP
-        let frames1 = decoder.decode_frames(&data, &[0]).expect("First decode failed");
-
-        // Decode again (simulating second GOP with same data for test)
-        let frames2 = decoder.decode_frames(&data, &[0]).expect("Second decode failed");
-
-        // Both should succeed with same dimensions
-        assert_eq!(frames1[0].width, frames2[0].width);
-        assert_eq!(frames1[0].height, frames2[0].height);
-        assert_eq!(frames1[0].data.len(), frames2[0].data.len());
-    }
-
-    #[test]
     fn test_frame_not_found() {
         let data = load_test_video();
         let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
 
-        // Request a frame index that's likely beyond the video length
-        let result = decoder.decode_frames(&data, &[9999]);
+        // Use an offset that doesn't exist
+        let result = decoder.decode_frame(&data, 99999999);
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            DecoderError::FrameNotFound { index, total } => {
-                assert_eq!(index, 9999);
-                assert!(total < 9999);
+            DecoderError::FrameNotFound(offset) => {
+                assert_eq!(offset, 99999999);
             }
             e => panic!("Expected FrameNotFound error, got: {:?}", e),
         }
     }
 
     #[test]
-    fn test_empty_frame_indices() {
+    fn test_decoder_reuse() {
         let data = load_test_video();
+        let first_offset = get_first_frame_offset();
+
         let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
 
-        let frames = decoder.decode_frames(&data, &[]).expect("Empty decode failed");
-        assert!(frames.is_empty());
+        // Decode same frame twice
+        let frame1 = decoder
+            .decode_frame(&data, first_offset)
+            .expect("First decode failed");
+        let frame2 = decoder
+            .decode_frame(&data, first_offset)
+            .expect("Second decode failed");
+
+        assert_eq!(frame1.width, frame2.width);
+        assert_eq!(frame1.height, frame2.height);
+        assert_eq!(frame1.data.len(), frame2.data.len());
     }
 
     #[test]
     fn test_yuv420p_format() {
         let data = load_test_video();
-        let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
+        let first_offset = get_first_frame_offset();
 
-        let frames = decoder.decode_frames(&data, &[0]).expect("Decode failed");
-        let frame = &frames[0];
+        let mut decoder = Decoder::new(&data).expect("Decoder creation failed");
+        let frame = decoder
+            .decode_frame(&data, first_offset)
+            .expect("Decode failed");
 
         // Verify linesize for packed YUV420P
         assert_eq!(frame.linesize[0], frame.width as i32);
@@ -543,24 +488,8 @@ mod benchmarks {
     use std::time::Instant;
 
     fn load_test_video() -> Bytes {
-        let possible_paths = vec![
-            "data/test.h265.mp4",
-            "../../../data/test.h265.mp4",
-            "../../data/test.h265.mp4",
-        ];
-
-        let path = std::env::var("TEST_VIDEO_PATH")
-            .ok()
-            .or_else(|| {
-                for p in possible_paths.iter() {
-                    if std::path::Path::new(p).exists() {
-                        return Some(p.to_string());
-                    }
-                }
-                None
-            })
-            .unwrap_or_else(|| "data/test.h265.mp4".to_string());
-
+        let path =
+            std::env::var("TEST_VIDEO_PATH").unwrap_or_else(|_| "data/test.h265.mp4".to_string());
         Bytes::from(std::fs::read(&path).expect("Test video not found"))
     }
 
@@ -586,39 +515,36 @@ mod benchmarks {
         let data = load_test_video();
         let mut decoder = Decoder::new(&data).unwrap();
 
+        // Get first frame offset for benchmark
+        let first_offset = {
+            use ffmpeg_next as ffmpeg;
+            let path = std::env::var("TEST_VIDEO_PATH")
+                .unwrap_or_else(|_| "data/test.h265.mp4".to_string());
+            let ictx = ffmpeg::format::input(&path).unwrap();
+            let stream_idx = ictx
+                .streams()
+                .best(ffmpeg::media::Type::Video)
+                .unwrap()
+                .index();
+            let mut ictx = ffmpeg::format::input(&path).unwrap();
+            ictx.packets()
+                .find(|(s, p)| s.index() == stream_idx && p.position() >= 0)
+                .map(|(_, p)| p.position() as u64)
+                .unwrap()
+        };
+
         // Warm up
-        let _ = decoder.decode_frames(&data, &[0]).unwrap();
+        let _ = decoder.decode_frame(&data, first_offset).unwrap();
 
         let iterations = 50;
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = decoder.decode_frames(&data, &[0]).unwrap();
+            let _ = decoder.decode_frame(&data, first_offset).unwrap();
         }
         let elapsed = start.elapsed();
 
         let avg_ms = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
         let fps = 1000.0 / avg_ms;
         println!("Single frame decode: {:.2}ms ({:.1} FPS)", avg_ms, fps);
-    }
-
-    #[test]
-    #[ignore]
-    fn benchmark_sequential_frames() {
-        let data = load_test_video();
-        let mut decoder = Decoder::new(&data).unwrap();
-
-        let start = Instant::now();
-        let frames = decoder.decode_all_frames(&data).unwrap();
-        let elapsed = start.elapsed();
-
-        let avg_ms = elapsed.as_secs_f64() * 1000.0 / frames.len() as f64;
-        let fps = frames.len() as f64 / elapsed.as_secs_f64();
-        println!(
-            "Sequential decode: {} frames in {:.2}ms ({:.2}ms/frame, {:.1} FPS)",
-            frames.len(),
-            elapsed.as_secs_f64() * 1000.0,
-            avg_ms,
-            fps
-        );
     }
 }
