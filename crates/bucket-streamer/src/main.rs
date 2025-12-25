@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use anyhow::Result;
+use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 mod config;
@@ -7,11 +10,12 @@ mod server;
 mod storage;
 
 use config::Config;
+use server::{create_router, AppState};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let config = Config::parse_args();
 
-    // Initialize tracing with configured level
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
@@ -23,8 +27,16 @@ fn main() -> Result<()> {
     tracing::info!("Starting bucket-streamer");
     tracing::debug!(?config, "Configuration loaded");
 
-    // Server startup will be added in Task 07
-    println!("bucket-streamer listening on {}", config.listen_addr);
+    let state = AppState {
+        config: Arc::new(config.clone()),
+    };
+
+    let app = create_router(state);
+
+    let listener = TcpListener::bind(&config.listen_addr).await?;
+    tracing::info!("Listening on {}", config.listen_addr);
+
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
