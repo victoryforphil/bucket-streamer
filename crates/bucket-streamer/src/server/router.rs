@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+use object_store::ObjectStore;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
@@ -9,7 +10,7 @@ use crate::config::Config;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    // Storage and pipeline components added in Task 11
+    pub store: Arc<dyn ObjectStore>,
 }
 
 /// Create the Axum router with all routes
@@ -35,8 +36,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() {
+        let config = Config::default();
+        let store = crate::storage::create_store(&config).unwrap();
+        
         let state = AppState {
-            config: Arc::new(Config::default()),
+            config: Arc::new(config),
+            store,
         };
         let app = create_router(state);
 

@@ -39,9 +39,7 @@ pub enum ClientMessage {
 
     /// Request frames by byte offset
     RequestFrames {
-        /// Byte offset of the IRAP (keyframe) to decode from
-        irap_offset: u64,
-        /// List of frames to extract
+        /// List of frames to extract (each with its own irap_offset)
         frames: Vec<FrameRequest>,
     },
 }
@@ -51,6 +49,8 @@ pub enum ClientMessage {
 pub struct FrameRequest {
     /// Byte offset of the frame in the video file
     pub offset: u64,
+    /// Byte offset of the IRAP (keyframe) needed to decode this frame
+    pub irap_offset: u64,
     /// Frame index (client-assigned, echoed back in response)
     pub index: u32,
 }
@@ -124,14 +124,14 @@ mod tests {
     #[test]
     fn test_request_frames_serialization() {
         let msg = ClientMessage::RequestFrames {
-            irap_offset: 1000,
             frames: vec![
-                FrameRequest { offset: 1500, index: 0 },
-                FrameRequest { offset: 2100, index: 1 },
+                FrameRequest { offset: 1500, irap_offset: 1000, index: 0 },
+                FrameRequest { offset: 2100, irap_offset: 1000, index: 1 },
             ],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"RequestFrames""#));
+        assert!(json.contains(r#""irap_offset":1000"#));
 
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg);
@@ -222,3 +222,11 @@ This is more efficient than base64 encoding JPEG in JSON.
 - `Error`: Session-level problem (video not found, malformed request)
 
 This allows clients to gracefully handle partial failures.
+
+### Per-Frame IRAP Offset
+Each `FrameRequest` carries its own `irap_offset` rather than having a batch-level IRAP. This design:
+- Allows requesting frames from different keyframe groups in one batch
+- Makes each frame request self-contained
+- Aligns with the flat offsets format (Task 12a) where each frame knows its IRAP
+
+Keyframe detection: `offset == irap_offset` indicates the frame is itself a keyframe.

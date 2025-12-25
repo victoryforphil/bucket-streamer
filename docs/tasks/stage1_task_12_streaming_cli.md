@@ -1,10 +1,11 @@
 # Task 12: Streaming CLI (Benchmark Client)
 
 ## Goal
-Create lightweight WebSocket client for benchmarking frame streaming. Outputs latency metrics in human-readable and JSON formats.
+Create lightweight WebSocket client for benchmarking frame streaming. Measures round-trip latency per frame with configurable batching.
 
 ## Dependencies
-- Task 06: WebSocket Protocol Types
+- Task 06: WebSocket Protocol Types (with per-frame `irap_offset`)
+- Task 12a: Flattened Offsets Format
 
 ## Files to Modify
 
@@ -40,10 +41,12 @@ url = "2"
 
 ```rust
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
@@ -52,21 +55,6 @@ use url::Url;
 #[command(about = "Benchmark client for bucket-streamer")]
 #[command(version)]
 struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Run frame request benchmark
-    Bench(BenchArgs),
-
-    /// Send a single request (for testing)
-    Request(RequestArgs),
-}
-
-#[derive(clap::Args)]
-struct BenchArgs {
     /// WebSocket server URL
     #[arg(short, long, default_value = "ws://localhost:3000/ws")]
     url: String,
@@ -75,61 +63,55 @@ struct BenchArgs {
     #[arg(short, long)]
     video: String,
 
-    /// Number of frames to request
-    #[arg(short, long, default_value = "100")]
-    frames: u32,
+    /// Path to JSON file with frame offsets
+    #[arg(short, long)]
+    frames_file: PathBuf,
 
-    /// IRAP offset for all frames
-    #[arg(long, default_value = "0")]
-    irap_offset: u64,
-
-    /// Starting frame offset
-    #[arg(long, default_value = "0")]
-    start_offset: u64,
-
-    /// Offset increment between frames
-    #[arg(long, default_value = "1000")]
-    offset_step: u64,
+    /// Frames per request batch (1 = sequential, N = batched)
+    #[arg(short, long, default_value = "1")]
+    batch: u32,
 
     /// Output as JSON
     #[arg(long)]
     json: bool,
+
+    /// Directory to save received JPEGs
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
-#[derive(clap::Args)]
-struct RequestArgs {
-    /// WebSocket server URL
-    #[arg(short, long, default_value = "ws://localhost:3000/ws")]
-    url: String,
+//=============================================================================
+// Offsets File Format (from Task 12a)
+//=============================================================================
 
-    /// Video path on server
-    #[arg(short, long)]
-    video: String,
+#[derive(Debug, Deserialize)]
+struct OffsetsFile {
+    video_url: String,
+    frames: Vec<FrameEntry>,
+}
 
-    /// Frame offset to request
-    #[arg(short, long)]
+#[derive(Debug, Deserialize)]
+struct FrameEntry {
     offset: u64,
-
-    /// IRAP offset
-    #[arg(long, default_value = "0")]
     irap_offset: u64,
-
-    /// Output as JSON
-    #[arg(long)]
-    json: bool,
 }
 
-// Protocol types (matching server)
+//=============================================================================
+// Protocol Types (matching server - Task 06)
+// TODO: Extract to shared crate
+//=============================================================================
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum ClientMessage {
     SetVideo { path: String },
-    RequestFrames { irap_offset: u64, frames: Vec<FrameRequest> },
+    RequestFrames { frames: Vec<FrameRequest> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FrameRequest {
     offset: u64,
+    irap_offset: u64,
     index: u32,
 }
 
@@ -142,7 +124,10 @@ enum ServerMessage {
     Error { message: String },
 }
 
-// Benchmark results
+//=============================================================================
+// Benchmark Results
+//=============================================================================
+
 #[derive(Debug, Serialize)]
 struct BenchmarkResult {
     frames_requested: u32,
@@ -159,17 +144,30 @@ struct BenchmarkResult {
     total_bytes: u64,
 }
 
+//=============================================================================
+// Main
+//=============================================================================
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Bench(args) => run_benchmark(args).await,
-        Commands::Request(args) => run_single_request(args).await,
-    }
+    run_benchmark(cli).await
 }
 
-async fn run_benchmark(args: BenchArgs) -> Result<()> {
+async fn run_benchmark(args: Cli) -> Result<()> {
+    // Load frames from file
+    let offsets_json = std::fs::read_to_string(&args.frames_file)
+        .context("Failed to read frames file")?;
+    let offsets: OffsetsFile = serde_json::from_str(&offsets_json)
+        .context("Failed to parse frames file")?;
+
+    // Create output directory if saving frames
+    if let Some(ref out_dir) = args.output {
+        std::fs::create_dir_all(out_dir)
+            .context("Failed to create output directory")?;
+    }
+
+    // Connect to WebSocket
     let url = Url::parse(&args.url).context("Invalid URL")?;
     let (ws, _) = connect_async(url).await.context("Failed to connect")?;
     let (mut sender, mut receiver) = ws.split();
@@ -178,94 +176,135 @@ async fn run_benchmark(args: BenchArgs) -> Result<()> {
     let set_video = ClientMessage::SetVideo {
         path: args.video.clone(),
     };
-    sender.send(Message::Text(serde_json::to_string(&set_video)?)).await?;
+    sender
+        .send(Message::Text(serde_json::to_string(&set_video)?))
+        .await?;
 
     // Wait for VideoSet response
     match receiver.next().await {
         Some(Ok(Message::Text(text))) => {
             let msg: ServerMessage = serde_json::from_str(&text)?;
-            if let ServerMessage::VideoSet { ok: false, .. } = msg {
-                anyhow::bail!("Video not found: {}", args.video);
-            }
-            if let ServerMessage::Error { message } = msg {
-                anyhow::bail!("Server error: {}", message);
+            match msg {
+                ServerMessage::VideoSet { ok: false, path } => {
+                    anyhow::bail!("Video not found: {}", path);
+                }
+                ServerMessage::Error { message } => {
+                    anyhow::bail!("Server error: {}", message);
+                }
+                ServerMessage::VideoSet { ok: true, .. } => {}
+                _ => anyhow::bail!("Unexpected response to SetVideo"),
             }
         }
-        _ => anyhow::bail!("Unexpected response to SetVideo"),
+        Some(Ok(_)) => anyhow::bail!("Unexpected response type to SetVideo"),
+        Some(Err(e)) => anyhow::bail!("WebSocket error: {}", e),
+        None => anyhow::bail!("Connection closed"),
     }
 
-    // Build frame requests
-    let frames: Vec<FrameRequest> = (0..args.frames)
-        .map(|i| FrameRequest {
-            offset: args.start_offset + (i as u64 * args.offset_step),
-            index: i,
+    // Build frame requests with indices
+    let all_frames: Vec<FrameRequest> = offsets
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| FrameRequest {
+            offset: f.offset,
+            irap_offset: f.irap_offset,
+            index: i as u32,
         })
         .collect();
 
-    let request = ClientMessage::RequestFrames {
-        irap_offset: args.irap_offset,
-        frames,
-    };
+    let total_frames = all_frames.len() as u32;
 
-    // Start timing
-    let start = Instant::now();
-    let mut latencies: Vec<f64> = Vec::with_capacity(args.frames as usize);
+    // Process in batches
+    let mut latencies: Vec<f64> = Vec::with_capacity(total_frames as usize);
     let mut received = 0u32;
     let mut errored = 0u32;
     let mut total_bytes = 0u64;
-    let mut frame_start = Instant::now();
 
-    // Send request
-    sender.send(Message::Text(serde_json::to_string(&request)?)).await?;
+    let overall_start = Instant::now();
 
-    // Receive responses
-    let mut expecting_binary = false;
-    while received + errored < args.frames {
-        match receiver.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let msg: ServerMessage = serde_json::from_str(&text)?;
-                match msg {
-                    ServerMessage::Frame { size, .. } => {
-                        expecting_binary = true;
-                        total_bytes += size as u64;
+    for batch in all_frames.chunks(args.batch as usize) {
+        let batch_start = Instant::now();
+
+        // Send batch request
+        let request = ClientMessage::RequestFrames {
+            frames: batch.to_vec(),
+        };
+        sender
+            .send(Message::Text(serde_json::to_string(&request)?))
+            .await?;
+
+        // Receive responses for this batch
+        let mut pending = batch.len();
+        let mut binary_queue: VecDeque<(u32, u64)> = VecDeque::new(); // (index, offset)
+
+        while pending > 0 {
+            match receiver.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let msg: ServerMessage = serde_json::from_str(&text)?;
+                    match msg {
+                        ServerMessage::Frame { index, offset, size } => {
+                            binary_queue.push_back((index, offset));
+                            total_bytes += size as u64;
+                        }
+                        ServerMessage::FrameError { index, offset, error } => {
+                            errored += 1;
+                            pending -= 1;
+                            latencies.push(batch_start.elapsed().as_secs_f64() * 1000.0);
+                            if !args.json {
+                                eprintln!(
+                                    "Frame error: index={}, offset={}, error={}",
+                                    index, offset, error
+                                );
+                            }
+                        }
+                        ServerMessage::Error { message } => {
+                            anyhow::bail!("Server error: {}", message);
+                        }
+                        _ => {}
                     }
-                    ServerMessage::FrameError { .. } => {
-                        errored += 1;
-                        latencies.push(frame_start.elapsed().as_secs_f64() * 1000.0);
-                        frame_start = Instant::now();
-                    }
-                    ServerMessage::Error { message } => {
-                        anyhow::bail!("Server error: {}", message);
-                    }
-                    _ => {}
                 }
-            }
-            Some(Ok(Message::Binary(_))) => {
-                if expecting_binary {
-                    received += 1;
-                    latencies.push(frame_start.elapsed().as_secs_f64() * 1000.0);
-                    frame_start = Instant::now();
-                    expecting_binary = false;
+                Some(Ok(Message::Binary(data))) => {
+                    if let Some((index, offset)) = binary_queue.pop_front() {
+                        received += 1;
+                        pending -= 1;
+                        latencies.push(batch_start.elapsed().as_secs_f64() * 1000.0);
+
+                        // Save frame if output directory specified
+                        if let Some(ref out_dir) = args.output {
+                            let path = out_dir.join(format!("frame_{:06}_{}.jpg", index, offset));
+                            std::fs::write(&path, &data)?;
+                        }
+                    }
                 }
+                Some(Err(e)) => anyhow::bail!("WebSocket error: {}", e),
+                None => anyhow::bail!("Connection closed unexpectedly"),
+                _ => {}
             }
-            Some(Err(e)) => anyhow::bail!("WebSocket error: {}", e),
-            None => break,
-            _ => {}
         }
     }
 
-    let total_time = start.elapsed();
+    let total_time = overall_start.elapsed();
 
     // Calculate statistics
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
+    let latency_avg = if latencies.is_empty() {
+        0.0
+    } else {
+        latencies.iter().sum::<f64>() / latencies.len() as f64
+    };
+
     let result = BenchmarkResult {
-        frames_requested: args.frames,
+        frames_requested: total_frames,
         frames_received: received,
         frames_errored: errored,
         total_time_ms: total_time.as_secs_f64() * 1000.0,
-        average_fps: received as f64 / total_time.as_secs_f64(),
-        latency_avg_ms: latencies.iter().sum::<f64>() / latencies.len() as f64,
+        average_fps: if total_time.as_secs_f64() > 0.0 {
+            received as f64 / total_time.as_secs_f64()
+        } else {
+            0.0
+        },
+        latency_avg_ms: latency_avg,
         latency_min_ms: *latencies.first().unwrap_or(&0.0),
         latency_max_ms: *latencies.last().unwrap_or(&0.0),
         latency_p50_ms: percentile(&latencies, 50),
@@ -274,6 +313,7 @@ async fn run_benchmark(args: BenchArgs) -> Result<()> {
         total_bytes,
     };
 
+    // Output results
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -292,89 +332,11 @@ async fn run_benchmark(args: BenchArgs) -> Result<()> {
         println!("  P50: {:.2}", result.latency_p50_ms);
         println!("  P95: {:.2}", result.latency_p95_ms);
         println!("  P99: {:.2}", result.latency_p99_ms);
-    }
 
-    Ok(())
-}
-
-async fn run_single_request(args: RequestArgs) -> Result<()> {
-    let url = Url::parse(&args.url).context("Invalid URL")?;
-    let (ws, _) = connect_async(url).await.context("Failed to connect")?;
-    let (mut sender, mut receiver) = ws.split();
-
-    // Set video
-    let set_video = ClientMessage::SetVideo {
-        path: args.video.clone(),
-    };
-    sender.send(Message::Text(serde_json::to_string(&set_video)?)).await?;
-
-    // Wait for VideoSet
-    if let Some(Ok(Message::Text(text))) = receiver.next().await {
-        let msg: ServerMessage = serde_json::from_str(&text)?;
-        if let ServerMessage::VideoSet { ok: false, .. } = msg {
-            anyhow::bail!("Video not found");
+        if let Some(ref out_dir) = args.output {
+            println!();
+            println!("Frames saved to: {}", out_dir.display());
         }
-    }
-
-    // Request single frame
-    let request = ClientMessage::RequestFrames {
-        irap_offset: args.irap_offset,
-        frames: vec![FrameRequest { offset: args.offset, index: 0 }],
-    };
-
-    let start = Instant::now();
-    sender.send(Message::Text(serde_json::to_string(&request)?)).await?;
-
-    // Receive response
-    let mut frame_size = 0u32;
-    let mut jpeg_data: Option<Vec<u8>> = None;
-
-    for _ in 0..2 {  // Expect Frame + Binary
-        match receiver.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let msg: ServerMessage = serde_json::from_str(&text)?;
-                match msg {
-                    ServerMessage::Frame { size, .. } => frame_size = size,
-                    ServerMessage::FrameError { error, .. } => {
-                        anyhow::bail!("Frame error: {}", error);
-                    }
-                    _ => {}
-                }
-            }
-            Some(Ok(Message::Binary(data))) => {
-                jpeg_data = Some(data);
-            }
-            _ => {}
-        }
-    }
-
-    let elapsed = start.elapsed();
-
-    if args.json {
-        #[derive(Serialize)]
-        struct SingleResult {
-            offset: u64,
-            size: u32,
-            latency_ms: f64,
-        }
-        let result = SingleResult {
-            offset: args.offset,
-            size: frame_size,
-            latency_ms: elapsed.as_secs_f64() * 1000.0,
-        };
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!("Frame received:");
-        println!("  Offset: {}", args.offset);
-        println!("  Size: {} bytes", frame_size);
-        println!("  Latency: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
-    }
-
-    // Optionally save JPEG
-    if let Some(data) = jpeg_data {
-        let path = format!("frame_{}.jpg", args.offset);
-        std::fs::write(&path, &data)?;
-        println!("  Saved: {}", path);
     }
 
     Ok(())
@@ -391,33 +353,39 @@ fn percentile(sorted: &[f64], p: u32) -> f64 {
 
 ## Success Criteria
 
-- [ ] `streaming-cli bench --video test.mp4 --frames 10` runs benchmark
+- [ ] `streaming-cli --video test.h265 --frames-file offsets.json` runs benchmark
+- [ ] Frames file is required (no synthetic offset generation)
+- [ ] `--batch 1` sends frames sequentially (default)
+- [ ] `--batch N` sends N frames per request
+- [ ] Latency measured as round-trip (batch send → frame receive)
 - [ ] Human-readable output shows FPS and latency stats
 - [ ] `--json` outputs valid JSON for scripting
-- [ ] `streaming-cli request --video test.mp4 --offset 1000` fetches single frame
-- [ ] Single request saves JPEG to disk
-- [ ] Errors (video not found, server down) reported cleanly
+- [ ] `-o ./output` saves JPEGs with naming: `frame_{index}_{offset}.jpg`
+- [ ] Errors (video not found, frame errors) reported cleanly
 - [ ] Works with `hyperfine` for repeated benchmarks
 
 ## Usage Examples
 
 ```bash
-# Basic benchmark
-streaming-cli bench --video test.h265.mp4 --frames 100
+# Sequential benchmark (precise latency)
+streaming-cli --video test.h265 --frames-file data/test.h265.offsets.json
 
-# Benchmark with JSON output
-streaming-cli bench --video test.h265.mp4 --frames 100 --json > results.json
+# Batched benchmark (throughput testing)
+streaming-cli --video test.h265 --frames-file data/test.h265.offsets.json --batch 10
 
-# Single frame request
-streaming-cli request --video test.h265.mp4 --offset 5000
+# Save frames to disk
+streaming-cli --video test.h265 --frames-file data/test.h265.offsets.json -o ./frames
 
-# Use with hyperfine for statistical analysis
-hyperfine --warmup 2 \
-  'streaming-cli bench --video test.h265.mp4 --frames 50'
+# JSON output for scripting
+streaming-cli --video test.h265 --frames-file data/test.h265.offsets.json --json > results.json
 
 # Connect to different server
-streaming-cli bench --url ws://192.168.1.100:3000/ws \
-  --video test.h265.mp4 --frames 100
+streaming-cli --url ws://192.168.1.100:3000/ws \
+  --video test.h265 --frames-file offsets.json
+
+# Use with hyperfine
+hyperfine --warmup 2 \
+  'streaming-cli --video test.h265 --frames-file offsets.json'
 ```
 
 ## Expected Output
@@ -425,12 +393,12 @@ streaming-cli bench --url ws://192.168.1.100:3000/ws \
 Human-readable:
 ```
 === Benchmark Results ===
-Frames requested: 100
-Frames received:  98
+Frames requested: 50
+Frames received:  48
 Frames errored:   2
-Total time:       4200.5ms
-Average FPS:      23.3
-Total bytes:      4523 KB
+Total time:       2100.5ms
+Average FPS:      22.8
+Total bytes:      2250 KB
 
 Latency (ms):
   Avg: 42.8
@@ -439,23 +407,25 @@ Latency (ms):
   P50: 41.1
   P95: 67.1
   P99: 85.2
+
+Frames saved to: ./frames
 ```
 
 JSON:
 ```json
 {
-  "frames_requested": 100,
-  "frames_received": 98,
+  "frames_requested": 50,
+  "frames_received": 48,
   "frames_errored": 2,
-  "total_time_ms": 4200.5,
-  "average_fps": 23.3,
+  "total_time_ms": 2100.5,
+  "average_fps": 22.8,
   "latency_avg_ms": 42.8,
   "latency_min_ms": 31.2,
   "latency_max_ms": 89.4,
   "latency_p50_ms": 41.1,
   "latency_p95_ms": 67.1,
   "latency_p99_ms": 85.2,
-  "total_bytes": 4631552
+  "total_bytes": 2304000
 }
 ```
 
@@ -468,25 +438,27 @@ JSON:
 - Hyperfine compatible: Single command invocation
 
 ### Latency Measurement
-Latency is measured from just before sending request to receiving complete JPEG. This includes:
-- Network round-trip
-- Server decode time
-- Server encode time
-- Response transmission
+Latency is measured from batch send to individual frame binary receive. With `--batch 1`, this is true round-trip per frame. With larger batches, it measures time from batch start to each frame's arrival.
 
 ### Percentile Calculations
 - P50 (median): Typical latency
 - P95: Most requests faster than this
 - P99: Tail latency, important for user experience
 
+### Frame→Binary Pairing
+Server sends `Frame` (JSON) immediately followed by binary JPEG. The CLI uses a queue to track which binary belongs to which frame index, handling them in order.
+
+### Protocol Types Duplication
+The protocol types (`ClientMessage`, `ServerMessage`, `FrameRequest`) are duplicated from the server. A TODO exists to extract these to a shared crate.
+
 ### Integration with Hyperfine
 
 ```bash
-# Compare different quality settings
-hyperfine --parameter-list quality 60,80,95 \
-  'streaming-cli bench --video test.mp4 --frames 50'
+# Compare batch sizes
+hyperfine --parameter-list batch 1,5,10 \
+  'streaming-cli --video test.h265 --frames-file offsets.json --batch {batch}'
 
 # Export to JSON for analysis
 hyperfine --export-json perf.json \
-  'streaming-cli bench --video test.mp4 --frames 100'
+  'streaming-cli --video test.h265 --frames-file offsets.json'
 ```

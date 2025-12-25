@@ -18,7 +18,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct GlobalOpts {
     /// JSON output format (machine-readable)
     #[arg(long, global = true)]

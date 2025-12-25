@@ -5,11 +5,13 @@ use axum::{
     },
     response::IntoResponse,
 };
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tracing::{debug, error, info, warn};
 
-use super::protocol::{ClientMessage, ServerMessage};
+use super::protocol::{ClientMessage, FrameRequest, ServerMessage};
 use super::router::AppState;
+use crate::pipeline::{decoder::Decoder, encoder::JpegEncoder, fetcher};
 
 /// WebSocket upgrade handler
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -17,19 +19,20 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
 }
 
 /// Handle a WebSocket session
-async fn handle_session(socket: WebSocket, _state: AppState) {
+async fn handle_session(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
 
     info!("WebSocket client connected");
 
-    // Session state (expanded in Task 11)
+    // Session state
     let mut video_path: Option<String> = None;
+    let mut video_data: Option<Bytes> = None;
 
     while let Some(msg_result) = receiver.next().await {
         let msg = match msg_result {
             Ok(m) => m,
             Err(e) => {
-                warn!("WebSocket receive error: {}", e);
+                warn!("WebSocket error: {}", e);
                 break;
             }
         };
@@ -40,12 +43,28 @@ async fn handle_session(socket: WebSocket, _state: AppState) {
 
                 match ClientMessage::from_json(&text) {
                     Ok(client_msg) => {
-                        let response = handle_message(client_msg, &mut video_path).await;
-                        let json = response.to_json();
-
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            error!("Failed to send response");
-                            break;
+                        match handle_message(
+                            client_msg,
+                            &mut video_path,
+                            &mut video_data,
+                            &state,
+                            &mut sender,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let error_msg = ServerMessage::Error {
+                                    message: e.to_string(),
+                                };
+                                if sender
+                                    .send(Message::Text(error_msg.to_json().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -62,56 +81,135 @@ async fn handle_session(socket: WebSocket, _state: AppState) {
                     }
                 }
             }
-            Message::Binary(_) => {
-                warn!("Unexpected binary message from client");
+            Message::Ping(data) => {
+                if sender.send(Message::Pong(data)).await.is_err() {
+                    break;
+                }
             }
-            Message::Ping(_) => {
-                // Axum automatically responds to pings with pongs
-            }
-            Message::Pong(_) => {
-                // Pong responses, no action needed
-            }
+            Message::Pong(_) => {}
             Message::Close(_) => {
-                info!("Client initiated close");
+                info!("Client closed connection");
                 break;
             }
+            _ => {}
         }
     }
 
     info!("WebSocket client disconnected");
 }
 
-/// Handle a parsed client message
-async fn handle_message(msg: ClientMessage, video_path: &mut Option<String>) -> ServerMessage {
+async fn handle_message(
+    msg: ClientMessage,
+    video_path: &mut Option<String>,
+    video_data: &mut Option<Bytes>,
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> anyhow::Result<()> {
     match msg {
         ClientMessage::SetVideo { path } => {
             info!("Setting video: {}", path);
-            *video_path = Some(path.clone());
-            // Video validation added in Task 11
-            ServerMessage::VideoSet { path, ok: true }
-        }
-        ClientMessage::RequestFrames {
-            irap_offset,
-            frames,
-        } => {
-            if video_path.is_none() {
-                return ServerMessage::Error {
-                    message: "No video set. Send SetVideo first.".to_string(),
+
+            // Check if video exists
+            if !fetcher::video_exists(&state.store, &path).await? {
+                let response = ServerMessage::VideoSet {
+                    path: path.clone(),
+                    ok: false,
                 };
+                sender
+                    .send(Message::Text(response.to_json().into()))
+                    .await?;
+                return Ok(());
             }
 
-            info!(
-                "Frame request: irap_offset={}, frame_count={}",
-                irap_offset,
-                frames.len()
-            );
+            // Fetch video data
+            let data = fetcher::fetch_video(&state.store, &path).await?;
 
-            // Frame decoding implemented in Task 11
-            ServerMessage::FrameError {
-                index: frames.first().map(|f| f.index).unwrap_or(0),
-                offset: irap_offset,
-                error: "not_implemented".to_string(),
+            *video_path = Some(path.clone());
+            *video_data = Some(data);
+
+            let response = ServerMessage::VideoSet { path, ok: true };
+            sender
+                .send(Message::Text(response.to_json().into()))
+                .await?;
+        }
+
+        ClientMessage::RequestFrames { frames } => {
+            if video_path.is_none() {
+                anyhow::bail!("No video set. Send SetVideo first.");
+            }
+
+            // Process frames in blocking task
+            let video_data_clone = video_data.as_ref().unwrap().clone();
+            let jpeg_quality = state.config.jpeg_quality;
+
+            for request in frames {
+                let video_data_inner = video_data_clone.clone();
+                let request_clone = request.clone();
+
+                // Process frame in blocking task (FFmpeg is not Send)
+                let result = tokio::task::spawn_blocking(move || {
+                    process_frame(video_data_inner, request_clone, jpeg_quality)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(jpeg_data)) => {
+                        // Send frame metadata
+                        let frame_msg = ServerMessage::Frame {
+                            index: request.index,
+                            offset: request.offset,
+                            size: jpeg_data.len() as u32,
+                        };
+                        sender
+                            .send(Message::Text(frame_msg.to_json().into()))
+                            .await?;
+
+                        // Send binary JPEG data
+                        sender.send(Message::Binary(jpeg_data.into())).await?;
+                    }
+                    Ok(Err(e)) => {
+                        let error_msg = ServerMessage::FrameError {
+                            index: request.index,
+                            offset: request.offset,
+                            error: e.to_string(),
+                        };
+                        sender
+                            .send(Message::Text(error_msg.to_json().into()))
+                            .await?;
+                    }
+                    Err(e) => {
+                        let error_msg = ServerMessage::FrameError {
+                            index: request.index,
+                            offset: request.offset,
+                            error: format!("Task join error: {}", e),
+                        };
+                        sender
+                            .send(Message::Text(error_msg.to_json().into()))
+                            .await?;
+                    }
+                }
             }
         }
     }
+
+    Ok(())
+}
+
+/// Process a single frame (runs in blocking context)
+fn process_frame(
+    video_data: Bytes,
+    request: FrameRequest,
+    jpeg_quality: u8,
+) -> anyhow::Result<Vec<u8>> {
+    // Create decoder
+    let mut decoder = Decoder::new(&video_data)?;
+
+    // Decode frame
+    let frame = decoder.decode_frame(&video_data, request.offset)?;
+
+    // Create encoder and encode
+    let mut encoder = JpegEncoder::new(jpeg_quality)?;
+    let jpeg = encoder.encode(&frame)?;
+
+    Ok(jpeg)
 }

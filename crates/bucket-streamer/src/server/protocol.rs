@@ -9,8 +9,6 @@ pub enum ClientMessage {
 
     /// Request frames by byte offset
     RequestFrames {
-        /// Byte offset of the IRAP (keyframe) to decode from
-        irap_offset: u64,
         /// List of frames to extract
         frames: Vec<FrameRequest>,
     },
@@ -21,6 +19,8 @@ pub enum ClientMessage {
 pub struct FrameRequest {
     /// Byte offset of the frame in the video file
     pub offset: u64,
+    /// Byte offset of the IRAP (keyframe) to decode from
+    pub irap_offset: u64,
     /// Frame index (client-assigned, echoed back in response)
     pub index: u32,
 }
@@ -90,14 +90,15 @@ mod tests {
     #[test]
     fn test_request_frames_serialization() {
         let msg = ClientMessage::RequestFrames {
-            irap_offset: 1000,
             frames: vec![
                 FrameRequest {
                     offset: 1500,
+                    irap_offset: 1000,
                     index: 0,
                 },
                 FrameRequest {
                     offset: 2100,
+                    irap_offset: 1000,
                     index: 1,
                 },
             ],

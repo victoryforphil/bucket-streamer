@@ -1455,6 +1455,7 @@ dependencies = [
  "clap",
  "ffmpeg-next",
  "indicatif",
+ "num_cpus",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
@@ -1800,12 +1801,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

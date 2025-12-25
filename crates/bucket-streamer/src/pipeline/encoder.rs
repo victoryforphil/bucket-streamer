@@ -16,8 +16,7 @@ impl JpegEncoder {
     /// * `quality` - JPEG quality (1-100, higher = better quality, larger size)
     pub fn new(quality: u8) -> Result<Self> {
         let quality = quality.clamp(1, 100) as i32;
-        let mut compressor = Compressor::new()
-            .context("Failed to create TurboJPEG compressor")?;
+        let mut compressor = Compressor::new().context("Failed to create TurboJPEG compressor")?;
 
         compressor
             .set_quality(quality)
@@ -26,7 +25,10 @@ impl JpegEncoder {
             .set_subsamp(Subsamp::Sub2x2)
             .context("Failed to set subsampling")?;
 
-        Ok(Self { compressor, quality })
+        Ok(Self {
+            compressor,
+            quality,
+        })
     }
 
     /// Encode a decoded frame to JPEG
@@ -41,7 +43,7 @@ impl JpegEncoder {
             pixels: frame.data.as_slice(),
             width: frame.width as usize,
             height: frame.height as usize,
-            align: 1, // Data is tightly packed (no row padding)
+            align: 1,                 // Data is tightly packed (no row padding)
             subsamp: Subsamp::Sub2x2, // 4:2:0 subsampling
         };
 

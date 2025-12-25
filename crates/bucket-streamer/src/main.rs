@@ -11,6 +11,7 @@ mod storage;
 
 use config::Config;
 use server::{create_router, AppState};
+use storage::create_store;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,8 +28,12 @@ async fn main() -> Result<()> {
     tracing::info!("Starting bucket-streamer");
     tracing::debug!(?config, "Configuration loaded");
 
+    // Create storage backend
+    let store = create_store(&config)?;
+
     let state = AppState {
         config: Arc::new(config.clone()),
+        store,
     };
 
     let app = create_router(state);

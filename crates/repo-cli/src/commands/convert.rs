@@ -41,6 +41,10 @@ pub struct ConvertArgs {
     /// Overwrite output file if it exists
     #[arg(long)]
     pub force: bool,
+
+    /// Enable GPU acceleration (NVENC) for faster encoding
+    #[arg(long)]
+    pub gpu: bool,
 }
 
 //=============================================================================
@@ -60,30 +64,16 @@ struct ConvertResult {
 struct FrameOffsets {
     /// S3 URL or fs:// URL for the video file
     video_url: String,
-    /// Total frame count
-    frame_count: usize,
-    /// IRAP (keyframe) groups with their dependent frames
-    iraps: Vec<IrapGroup>,
+    /// All frames with their IRAP offsets
+    frames: Vec<FrameEntry>,
 }
 
 #[derive(Serialize)]
-struct IrapGroup {
-    /// Byte offset of the IRAP/keyframe in the file
+struct FrameEntry {
+    /// Byte offset of this frame in the file
     offset: u64,
-    /// All frames in this group (including the keyframe)
-    frames: Vec<FrameInfo>,
-}
-
-#[derive(Serialize)]
-struct FrameInfo {
-    /// Byte offset in the file
-    offset: u64,
-    /// Size in bytes
-    size: u64,
-    /// Frame index (0-based, across entire video)
-    index: u32,
-    /// True if this is a keyframe/IRAP
-    is_keyframe: bool,
+    /// Byte offset of the IRAP (keyframe) needed to decode this frame
+    irap_offset: u64,
 }
 
 //=============================================================================
@@ -229,11 +219,35 @@ type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 // FFmpeg Transcoding
 //=============================================================================
 
+/// Select encoder based on GPU acceleration preference
+///
+/// Returns the encoder codec and the appropriate pixel format to use.
+/// If GPU is requested but NVENC is unavailable, falls back to CPU with a warning.
+fn select_encoder(use_gpu: bool) -> Result<(ffmpeg::codec::codec::Codec, ffmpeg::format::Pixel)> {
+    if use_gpu {
+        if let Some(codec) = ffmpeg::encoder::find_by_name("hevc_nvenc") {
+            println!("Using NVENC GPU encoder");
+            return Ok((codec, ffmpeg::format::Pixel::NV12));
+        } else {
+            eprintln!("Warning: NVENC not available, falling back to CPU encoding");
+        }
+    }
+
+    // Default: CPU encoding with libx265
+    let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::HEVC).ok_or(CliError::EncoderNotFound)?;
+    Ok((codec, ffmpeg::format::Pixel::YUV420P))
+}
+
 /// Transcode video to H.265 format (video only, no audio)
 ///
 /// Runs in a blocking task since FFmpeg operations are CPU-intensive.
 /// Reports progress via callback with (current_frame, total_frames).
-fn convert_to_h265(input: &str, output: &str, progress: Option<ProgressCallback>) -> Result<usize> {
+fn convert_to_h265(
+    input: &str,
+    output: &str,
+    use_gpu: bool,
+    progress: Option<ProgressCallback>,
+) -> Result<usize> {
     ffmpeg::init().context("Failed to initialize FFmpeg")?;
 
     // Open input
@@ -258,12 +272,24 @@ fn convert_to_h265(input: &str, output: &str, progress: Option<ProgressCallback>
     };
 
     // Setup decoder
-    let decoder_ctx = ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())
-        .context("Failed to create decoder context")?;
+    // Note: CUVID hardware decoders can have compatibility issues with some codecs/containers
+    // For now, stick with software decoding for maximum compatibility
+    let mut decoder_ctx =
+        ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())
+            .context("Failed to create decoder context")?;
+
+    // Enable multi-threading for decoder (frame-level threading)
+    // Cap at 16 threads (recommended max for most codecs)
+    let thread_count = num_cpus::get().min(16);
+    decoder_ctx.set_threading(ffmpeg::codec::threading::Config {
+        kind: ffmpeg::codec::threading::Type::Frame,
+        count: thread_count,
+    });
+
     let mut decoder = decoder_ctx.decoder().video()?;
 
-    // Find HEVC encoder
-    let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::HEVC).ok_or(CliError::EncoderNotFound)?;
+    // Select encoder based on GPU preference
+    let (codec, target_pixel_format) = select_encoder(use_gpu)?;
 
     // Setup output container (video only)
     let mut octx = ffmpeg::format::output(output).context("Failed to create output file")?;
@@ -273,7 +299,17 @@ fn convert_to_h265(input: &str, output: &str, progress: Option<ProgressCallback>
     let output_time_base = output_stream.time_base();
 
     // Setup encoder context
-    let encoder_ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+    let mut encoder_ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+
+    // Enable multi-threading for encoder (only for CPU encoding - GPU handles its own parallelism)
+    // x265 has a hard limit on frame threads, so cap at reasonable number
+    if !use_gpu {
+        encoder_ctx.set_threading(ffmpeg::codec::threading::Config {
+            kind: ffmpeg::codec::threading::Type::Frame,
+            count: thread_count.min(8), // x265 works best with fewer frame threads
+        });
+    }
+
     let mut encoder = encoder_ctx.encoder().video()?;
 
     // Configure encoder
@@ -286,8 +322,8 @@ fn convert_to_h265(input: &str, output: &str, progress: Option<ProgressCallback>
         encoder.set_frame_rate(Some(frame_rate));
     }
 
-    // Use YUV420P - standard format for H.265
-    encoder.set_format(ffmpeg::format::Pixel::YUV420P);
+    // Use pixel format appropriate for the encoder (NV12 for GPU, YUV420P for CPU)
+    encoder.set_format(target_pixel_format);
 
     // Open encoder with default options
     let mut encoder = encoder.open_as(codec)?;
@@ -296,12 +332,12 @@ fn convert_to_h265(input: &str, output: &str, progress: Option<ProgressCallback>
     output_stream.set_parameters(&encoder);
 
     // Setup scaler for pixel format conversion if needed
-    let mut scaler = if decoder.format() != ffmpeg::format::Pixel::YUV420P {
+    let mut scaler = if decoder.format() != target_pixel_format {
         Some(ffmpeg::software::scaling::Context::get(
             decoder.format(),
             decoder.width(),
             decoder.height(),
-            ffmpeg::format::Pixel::YUV420P,
+            target_pixel_format,
             decoder.width(),
             decoder.height(),
             ffmpeg::software::scaling::Flags::BILINEAR,
@@ -402,7 +438,7 @@ fn convert_to_h265(input: &str, output: &str, progress: Option<ProgressCallback>
 
 /// Extract frame byte offsets from an H.265 video file
 ///
-/// Reads packet metadata to build IRAP groups for seeking.
+/// Reads packet metadata to build flat array with each frame's IRAP offset.
 fn extract_frame_offsets(video_path: &str, storage_url: &str, output_path: &str) -> Result<usize> {
     ffmpeg::init().context("Failed to initialize FFmpeg")?;
 
@@ -415,9 +451,8 @@ fn extract_frame_offsets(video_path: &str, storage_url: &str, output_path: &str)
         .ok_or(CliError::NoVideoStream)?;
     let stream_index = video_stream.index();
 
-    let mut iraps: Vec<IrapGroup> = Vec::new();
-    let mut current_irap: Option<IrapGroup> = None;
-    let mut frame_index: u32 = 0;
+    let mut frames: Vec<FrameEntry> = Vec::new();
+    let mut current_irap_offset: u64 = 0;
 
     for (stream, packet) in ictx.packets() {
         if stream.index() != stream_index {
@@ -426,54 +461,34 @@ fn extract_frame_offsets(video_path: &str, storage_url: &str, output_path: &str)
 
         let is_keyframe = packet.is_key();
         let offset = packet.position();
-        let size = packet.size();
 
         // Skip if position is unknown (-1)
         if offset < 0 {
-            frame_index += 1;
             continue;
         }
 
-        let frame_info = FrameInfo {
-            offset: offset as u64,
-            size: size as u64,
-            index: frame_index,
-            is_keyframe,
-        };
+        let offset = offset as u64;
 
+        // Update IRAP offset when we hit a keyframe
         if is_keyframe {
-            // Save previous IRAP group if exists
-            if let Some(group) = current_irap.take() {
-                iraps.push(group);
-            }
-            // Start new IRAP group
-            current_irap = Some(IrapGroup {
-                offset: offset as u64,
-                frames: vec![frame_info],
-            });
-        } else if let Some(ref mut group) = current_irap {
-            group.frames.push(frame_info);
+            current_irap_offset = offset;
         }
-        // Note: frames before first keyframe are dropped (rare edge case)
 
-        frame_index += 1;
-    }
-
-    // Save final IRAP group
-    if let Some(group) = current_irap {
-        iraps.push(group);
+        frames.push(FrameEntry {
+            offset,
+            irap_offset: current_irap_offset,
+        });
     }
 
     let offsets = FrameOffsets {
         video_url: storage_url.to_string(),
-        frame_count: frame_index as usize,
-        iraps,
+        frames,
     };
 
     let json = serde_json::to_string_pretty(&offsets)?;
     std::fs::write(output_path, json)?;
 
-    Ok(frame_index as usize)
+    Ok(offsets.frames.len())
 }
 
 //=============================================================================
@@ -509,6 +524,7 @@ async fn convert_single_file(
     extract_offsets: bool,
     storage_url: Option<&str>,
     force: bool,
+    gpu: bool,
 ) -> Result<ConvertResult> {
     // Validate input file
     validate_input(input).context("Input validation failed")?;
@@ -550,7 +566,7 @@ async fn convert_single_file(
 
     // Run transcoding in blocking task
     let frame_count = tokio::task::spawn_blocking(move || {
-        convert_to_h265(&input_clone, &output_clone, progress_cb)
+        convert_to_h265(&input_clone, &output_clone, gpu, progress_cb)
     })
     .await
     .context("Transcoding task panicked")??;
@@ -597,6 +613,7 @@ async fn run_batch(
     extract_offsets: bool,
     storage_url: Option<&str>,
     force: bool,
+    gpu: bool,
 ) -> Result<BatchSummary> {
     // Find all .mp4 files
     let mp4_files = find_mp4_files(input_dir)?;
@@ -623,6 +640,7 @@ async fn run_batch(
     // Determine output directory
     let out_dir = output_dir.unwrap_or(input_dir);
 
+    // Process files sequentially to avoid progress bar conflicts
     for (idx, input_file) in mp4_files.iter().enumerate() {
         println!("[{}/{}] Converting: {}", idx + 1, total_files, input_file);
 
@@ -661,6 +679,7 @@ async fn run_batch(
             extract_offsets,
             storage_url,
             force,
+            gpu,
         )
         .await
         {
@@ -758,6 +777,7 @@ pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
             args.extract_offsets,
             args.storage_url.as_deref(),
             args.force,
+            args.gpu,
         )
         .await?;
 
@@ -774,6 +794,7 @@ pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
             args.extract_offsets,
             args.storage_url.as_deref(),
             args.force,
+            args.gpu,
         )
         .await?;
 
