@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     libturbojpeg0-dev \
     pkg-config \
     clang \
+    nasm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
