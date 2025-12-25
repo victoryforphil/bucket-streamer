@@ -49,7 +49,7 @@ pub async fn fetch_range(
     end: u64,
 ) -> Result<Bytes> {
     let path = Path::from(path);
-    let range = start..end;
+    let range = (start as usize)..(end as usize);
 
     let bytes = store
         .get_range(&path, range)

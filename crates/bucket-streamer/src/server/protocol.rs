@@ -92,8 +92,14 @@ mod tests {
         let msg = ClientMessage::RequestFrames {
             irap_offset: 1000,
             frames: vec![
-                FrameRequest { offset: 1500, index: 0 },
-                FrameRequest { offset: 2100, index: 1 },
+                FrameRequest {
+                    offset: 1500,
+                    index: 0,
+                },
+                FrameRequest {
+                    offset: 2100,
+                    index: 1,
+                },
             ],
         };
         let json = serde_json::to_string(&msg).unwrap();
