@@ -1,32 +1,54 @@
 # Task 07: Axum Server & WebSocket Handler
 
 ## Goal
-Set up Axum HTTP server with `/health` and `/ws` routes. Implement WebSocket upgrade and basic session loop that logs messages.
+Set up Axum HTTP server with `/health` and `/ws` routes. Implement WebSocket upgrade and basic session loop that logs messages and handles protocol types from Task 06.
 
 ## Dependencies
-- Task 04: Server Config
-- Task 06: WebSocket Protocol Types
+- Task 04: Server Config (complete)
+- Task 06: WebSocket Protocol Types (complete)
 
 ## Files to Modify
 
 ```
-crates/bucket-streamer/src/server/router.rs     # Axum router setup
-crates/bucket-streamer/src/server/websocket.rs  # WS handler and session loop
-crates/bucket-streamer/src/main.rs              # Start server
+crates/bucket-streamer/Cargo.toml              # Add futures-util
+Cargo.toml                                      # Add futures-util to workspace
+crates/bucket-streamer/src/server/mod.rs       # Export router types
+crates/bucket-streamer/src/server/router.rs    # Axum router setup
+crates/bucket-streamer/src/server/websocket.rs # WS handler and session loop
+crates/bucket-streamer/src/main.rs             # Start server with tokio
 ```
 
 ## Steps
 
-### 1. Implement server/router.rs
+### 1. Add futures-util dependency
+
+In workspace `Cargo.toml`, add to `[workspace.dependencies]`:
+```toml
+futures-util = "0.3"
+```
+
+In `crates/bucket-streamer/Cargo.toml`, add to `[dependencies]`:
+```toml
+futures-util.workspace = true
+```
+
+### 2. Update server/mod.rs
 
 ```rust
-use axum::{
-    Router,
-    routing::get,
-    response::IntoResponse,
-    http::StatusCode,
-};
+pub mod protocol;
+pub mod router;
+pub mod websocket;
+
+pub use protocol::{ClientMessage, FrameRequest, ServerMessage};
+pub use router::{create_router, AppState};
+```
+
+### 3. Implement server/router.rs
+
+```rust
 use std::sync::Arc;
+
+use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
@@ -35,7 +57,7 @@ use crate::config::Config;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    // Storage and other shared state added in Task 11
+    // Storage and pipeline components added in Task 11
 }
 
 /// Create the Axum router with all routes
@@ -51,194 +73,7 @@ pub fn create_router(state: AppState) -> Router {
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
-```
 
-### 2. Implement server/websocket.rs
-
-```rust
-use axum::{
-    extract::{
-        State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
-    response::IntoResponse,
-};
-use futures_util::{SinkExt, StreamExt};
-use tracing::{info, warn, error, debug};
-
-use super::protocol::{ClientMessage, ServerMessage};
-use super::router::AppState;
-
-/// WebSocket upgrade handler
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_session(socket, state))
-}
-
-/// Handle a WebSocket session
-async fn handle_session(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
-
-    info!("WebSocket client connected");
-
-    // Session state (expanded in Task 11)
-    let mut video_path: Option<String> = None;
-
-    while let Some(msg_result) = receiver.next().await {
-        let msg = match msg_result {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("WebSocket receive error: {}", e);
-                break;
-            }
-        };
-
-        match msg {
-            Message::Text(text) => {
-                debug!("Received: {}", text);
-
-                match ClientMessage::from_json(&text) {
-                    Ok(client_msg) => {
-                        let response = handle_message(client_msg, &mut video_path, &state).await;
-                        let json = response.to_json();
-
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            error!("Failed to send response");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = ServerMessage::Error {
-                            message: format!("Invalid message: {}", e),
-                        };
-                        if sender.send(Message::Text(error_msg.to_json().into())).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            Message::Binary(_) => {
-                // Binary messages from client not expected in protocol
-                warn!("Unexpected binary message from client");
-            }
-            Message::Ping(data) => {
-                if sender.send(Message::Pong(data)).await.is_err() {
-                    break;
-                }
-            }
-            Message::Pong(_) => {}
-            Message::Close(_) => {
-                info!("Client initiated close");
-                break;
-            }
-        }
-    }
-
-    info!("WebSocket client disconnected");
-}
-
-/// Handle a parsed client message
-async fn handle_message(
-    msg: ClientMessage,
-    video_path: &mut Option<String>,
-    _state: &AppState,
-) -> ServerMessage {
-    match msg {
-        ClientMessage::SetVideo { path } => {
-            info!("Setting video: {}", path);
-            *video_path = Some(path.clone());
-            // TODO: Verify video exists (Task 11)
-            ServerMessage::VideoSet { path, ok: true }
-        }
-        ClientMessage::RequestFrames { irap_offset, frames } => {
-            if video_path.is_none() {
-                return ServerMessage::Error {
-                    message: "No video set. Send SetVideo first.".to_string(),
-                };
-            }
-
-            info!(
-                "Frame request: irap_offset={}, frame_count={}",
-                irap_offset,
-                frames.len()
-            );
-
-            // TODO: Actually decode frames (Task 11)
-            // For now, return stub error
-            ServerMessage::FrameError {
-                index: frames.first().map(|f| f.index).unwrap_or(0),
-                offset: irap_offset,
-                error: "not_implemented".to_string(),
-            }
-        }
-    }
-}
-```
-
-### 3. Add futures-util dependency
-
-In workspace Cargo.toml:
-```toml
-[workspace.dependencies]
-futures-util = "0.3"
-```
-
-In bucket-streamer Cargo.toml:
-```toml
-[dependencies]
-futures-util.workspace = true
-```
-
-### 4. Update main.rs to start server
-
-```rust
-use anyhow::Result;
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
-
-mod config;
-mod pipeline;
-mod server;
-mod storage;
-
-use config::Config;
-use server::router::{create_router, AppState};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let config = Config::parse_args();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
-        )
-        .init();
-
-    config.validate()?;
-
-    let state = AppState {
-        config: Arc::new(config.clone()),
-    };
-
-    let app = create_router(state);
-
-    let listener = TcpListener::bind(&config.listen_addr).await?;
-    tracing::info!("Listening on {}", config.listen_addr);
-
-    axum::serve(listener, app).await?;
-
-    Ok(())
-}
-```
-
-### 5. Add integration test
-
-```rust
-// tests/websocket_test.rs or inline in websocket.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,46 +98,222 @@ mod tests {
 }
 ```
 
+### 4. Implement server/websocket.rs
+
+```rust
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+};
+use futures_util::{SinkExt, StreamExt};
+use tracing::{debug, error, info, warn};
+
+use super::protocol::{ClientMessage, ServerMessage};
+use super::router::AppState;
+
+/// WebSocket upgrade handler
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_session(socket, state))
+}
+
+/// Handle a WebSocket session
+async fn handle_session(socket: WebSocket, _state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    info!("WebSocket client connected");
+
+    // Session state (expanded in Task 11)
+    let mut video_path: Option<String> = None;
+
+    while let Some(msg_result) = receiver.next().await {
+        let msg = match msg_result {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("WebSocket receive error: {}", e);
+                break;
+            }
+        };
+
+        match msg {
+            Message::Text(text) => {
+                debug!("Received: {}", text);
+
+                match ClientMessage::from_json(&text) {
+                    Ok(client_msg) => {
+                        let response = handle_message(client_msg, &mut video_path).await;
+                        let json = response.to_json();
+
+                        if sender.send(Message::Text(json)).await.is_err() {
+                            error!("Failed to send response");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = ServerMessage::Error {
+                            message: format!("Invalid message: {}", e),
+                        };
+                        if sender.send(Message::Text(error_msg.to_json())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Message::Binary(_) => {
+                warn!("Unexpected binary message from client");
+            }
+            Message::Ping(_) => {
+                // Axum automatically responds to pings with pongs
+            }
+            Message::Pong(_) => {
+                // Pong responses, no action needed
+            }
+            Message::Close(_) => {
+                info!("Client initiated close");
+                break;
+            }
+        }
+    }
+
+    info!("WebSocket client disconnected");
+}
+
+/// Handle a parsed client message
+async fn handle_message(msg: ClientMessage, video_path: &mut Option<String>) -> ServerMessage {
+    match msg {
+        ClientMessage::SetVideo { path } => {
+            info!("Setting video: {}", path);
+            *video_path = Some(path.clone());
+            // Video validation added in Task 11
+            ServerMessage::VideoSet { path, ok: true }
+        }
+        ClientMessage::RequestFrames { irap_offset, frames } => {
+            if video_path.is_none() {
+                return ServerMessage::Error {
+                    message: "No video set. Send SetVideo first.".to_string(),
+                };
+            }
+
+            info!(
+                "Frame request: irap_offset={}, frame_count={}",
+                irap_offset,
+                frames.len()
+            );
+
+            // Frame decoding implemented in Task 11
+            ServerMessage::FrameError {
+                index: frames.first().map(|f| f.index).unwrap_or(0),
+                offset: irap_offset,
+                error: "not_implemented".to_string(),
+            }
+        }
+    }
+}
+```
+
+### 5. Update main.rs
+
+```rust
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::net::TcpListener;
+use tracing_subscriber::EnvFilter;
+
+mod config;
+mod pipeline;
+mod server;
+mod storage;
+
+use config::Config;
+use server::{create_router, AppState};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = Config::parse_args();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+        )
+        .init();
+
+    config.validate()?;
+
+    tracing::info!("Starting bucket-streamer");
+    tracing::debug!(?config, "Configuration loaded");
+
+    let state = AppState {
+        config: Arc::new(config.clone()),
+    };
+
+    let app = create_router(state);
+
+    let listener = TcpListener::bind(&config.listen_addr).await?;
+    tracing::info!("Listening on {}", config.listen_addr);
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+```
+
 ## Success Criteria
 
+- [ ] `cargo build -p bucket-streamer` compiles without errors
+- [ ] `cargo test -p bucket-streamer` passes (including health check test)
 - [ ] `cargo run -p bucket-streamer` starts server on port 3000
-- [ ] `curl http://localhost:3000/health` returns "ok"
-- [ ] WebSocket connects at `ws://localhost:3000/ws`
-- [ ] SetVideo message returns VideoSet response
-- [ ] RequestFrames without SetVideo returns Error
-- [ ] Invalid JSON returns Error with parse message
-- [ ] Clean disconnect logging on client close
-- [ ] Tests pass: `cargo test -p bucket-streamer`
+- [ ] `curl http://localhost:3000/health` returns "ok" with 200 status
+- [ ] WebSocket connects at `ws://localhost:3000/ws` (manual test with websocat or browser)
+- [ ] Server logs "WebSocket client connected/disconnected" on connect/close
+
+## Manual WebSocket Testing
+
+Use `websocat` or similar tool:
+```bash
+# Install websocat if needed: cargo install websocat
+websocat ws://localhost:3000/ws
+
+# Send SetVideo message:
+{"type":"SetVideo","path":"test.mp4"}
+# Expected response: {"type":"VideoSet","path":"test.mp4","ok":true}
+
+# Send RequestFrames without SetVideo:
+{"type":"RequestFrames","irap_offset":0,"frames":[{"offset":100,"index":0}]}
+# Expected response: {"type":"Error","message":"No video set. Send SetVideo first."}
+```
 
 ## Context
 
-### Axum WebSocket Pattern
-Axum 0.8 uses `WebSocketUpgrade` extractor:
+### Axum 0.7 WebSocket Pattern
+Axum 0.7 uses `WebSocketUpgrade` extractor. The `on_upgrade` callback runs as a spawned task after the HTTP upgrade completes:
 ```rust
 pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(handle_session)
 }
 ```
 
-The `handle_session` runs as a spawned task after upgrade completes.
-
 ### futures-util for Stream/Sink
-`socket.split()` requires `StreamExt` and `SinkExt` from futures-util:
-- `receiver.next().await` - get next message
-- `sender.send(msg).await` - send message
+`socket.split()` returns types that implement `Stream` and `Sink`. Import traits from futures-util:
+- `StreamExt::next()` - receive next message
+- `SinkExt::send()` - send message
+
+### Message Type
+In Axum 0.7, `Message::Text(String)` contains a `String` directly. No conversion needed when sending JSON strings.
 
 ### State Sharing
 `AppState` is cloned into each handler. Use `Arc<T>` for expensive-to-clone data:
 ```rust
 pub struct AppState {
     pub config: Arc<Config>,
-    pub store: Arc<dyn ObjectStore>,  // Added in Task 11
+    // Future: Arc<dyn ObjectStore>, pipeline channels, etc.
 }
 ```
 
-### Testing WebSocket Connections
-For integration tests with actual WS connection, use `tokio-tungstenite`:
-```rust
-let (ws, _) = tokio_tungstenite::connect_async("ws://localhost:3000/ws").await?;
-```
-This is tested more thoroughly in Task 12 (Streaming CLI).
+### Ping/Pong Handling
+Axum's WebSocket implementation automatically responds to Ping frames with Pong frames. Explicit handling is optional.
