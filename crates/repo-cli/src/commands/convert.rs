@@ -45,6 +45,14 @@ pub struct ConvertArgs {
     /// Enable GPU acceleration (NVENC) for faster encoding
     #[arg(long)]
     pub gpu: bool,
+
+    /// Downscale video by integer divisor (2 = half resolution, 4 = quarter)
+    #[arg(long)]
+    pub downscale: Option<u32>,
+
+    /// Target output framerate (e.g., 30, 24, 15)
+    #[arg(long)]
+    pub fps: Option<f64>,
 }
 
 //=============================================================================
@@ -161,6 +169,49 @@ fn determine_storage_url(output_path: &str, provided: Option<&str>) -> Result<St
     Ok(format!("fs://{}", abs_path.display()))
 }
 
+/// Validates downscale divisor and checks minimum output dimensions
+fn validate_downscale(divisor: u32, width: u32, height: u32) -> Result<()> {
+    // Must be power of 2
+    if !divisor.is_power_of_two() {
+        return Err(CliError::InvalidInput(format!(
+            "Downscale divisor must be power of 2, got {}",
+            divisor
+        ))
+        .into());
+    }
+
+    // Check minimum dimensions (64x64)
+    if width / divisor < 64 || height / divisor < 64 {
+        return Err(CliError::InvalidInput(format!(
+            "Downscaled dimensions {}x{} too small (min 64x64)",
+            width / divisor,
+            height / divisor
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Validates target FPS is positive and not higher than input
+fn validate_fps(fps: f64, input_fps: f64) -> Result<()> {
+    if fps <= 0.0 {
+        return Err(
+            CliError::InvalidInput(format!("FPS must be positive, got {}", fps)).into(),
+        );
+    }
+
+    if fps > input_fps {
+        return Err(CliError::InvalidInput(format!(
+            "Target FPS {} exceeds input FPS {:.2}",
+            fps, input_fps
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
 //=============================================================================
 // Batch Mode Validation
 //=============================================================================
@@ -226,7 +277,7 @@ type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 fn select_encoder(use_gpu: bool) -> Result<(ffmpeg::codec::codec::Codec, ffmpeg::format::Pixel)> {
     if use_gpu {
         if let Some(codec) = ffmpeg::encoder::find_by_name("hevc_nvenc") {
-            println!("Using NVENC GPU encoder");
+            println!("Using NVENC GPU encoder with p7 preset and CRF 9");
             return Ok((codec, ffmpeg::format::Pixel::NV12));
         } else {
             eprintln!("Warning: NVENC not available, falling back to CPU encoding");
@@ -234,6 +285,7 @@ fn select_encoder(use_gpu: bool) -> Result<(ffmpeg::codec::codec::Codec, ffmpeg:
     }
 
     // Default: CPU encoding with libx265
+    println!("Using libx265 CPU encoder with CRF 9 (near-lossless quality)");
     let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::HEVC).ok_or(CliError::EncoderNotFound)?;
     Ok((codec, ffmpeg::format::Pixel::YUV420P))
 }
@@ -246,6 +298,8 @@ fn convert_to_h265(
     input: &str,
     output: &str,
     use_gpu: bool,
+    downscale: Option<u32>,
+    target_fps: Option<f64>,
     progress: Option<ProgressCallback>,
 ) -> Result<usize> {
     ffmpeg::init().context("Failed to initialize FFmpeg")?;
@@ -312,9 +366,27 @@ fn convert_to_h265(
 
     let mut encoder = encoder_ctx.encoder().video()?;
 
+    // Calculate output dimensions (apply downscaling if requested)
+    let (output_width, output_height) = if let Some(divisor) = downscale {
+        validate_downscale(divisor, decoder.width(), decoder.height())?;
+        let new_width = decoder.width() / divisor;
+        let new_height = decoder.height() / divisor;
+        println!(
+            "Downscaling video: {}x{} -> {}x{} (divisor: {})",
+            decoder.width(),
+            decoder.height(),
+            new_width,
+            new_height,
+            divisor
+        );
+        (new_width, new_height)
+    } else {
+        (decoder.width(), decoder.height())
+    };
+
     // Configure encoder
-    encoder.set_width(decoder.width());
-    encoder.set_height(decoder.height());
+    encoder.set_width(output_width);
+    encoder.set_height(output_height);
     encoder.set_time_base(time_base);
 
     let frame_rate = input_stream.avg_frame_rate();
@@ -325,21 +397,36 @@ fn convert_to_h265(
     // Use pixel format appropriate for the encoder (NV12 for GPU, YUV420P for CPU)
     encoder.set_format(target_pixel_format);
 
-    // Open encoder with default options
-    let mut encoder = encoder.open_as(codec)?;
+    // Open encoder with quality settings
+    let mut encoder = if use_gpu {
+        // GPU: p7 preset with CRF 9
+        let mut opts = ffmpeg::Dictionary::new();
+        opts.set("preset", "p7");
+        opts.set("rc", "vbr");
+        opts.set("cq", "9");
+        opts.set("b:v", "0");
+        encoder.open_with(opts)?
+    } else {
+        // CPU: CRF 9 with medium preset
+        let mut opts = ffmpeg::Dictionary::new();
+        opts.set("crf", "9");
+        opts.set("preset", "medium");
+        encoder.open_with(opts)?
+    };
 
     // Set stream parameters from encoder
     output_stream.set_parameters(&encoder);
 
-    // Setup scaler for pixel format conversion if needed
-    let mut scaler = if decoder.format() != target_pixel_format {
+    // Setup scaler for pixel format conversion and/or downscaling
+    let needs_scaling = downscale.is_some() || decoder.format() != target_pixel_format;
+    let mut scaler = if needs_scaling {
         Some(ffmpeg::software::scaling::Context::get(
             decoder.format(),
             decoder.width(),
             decoder.height(),
             target_pixel_format,
-            decoder.width(),
-            decoder.height(),
+            output_width,
+            output_height,
             ffmpeg::software::scaling::Flags::BILINEAR,
         )?)
     } else {
@@ -348,7 +435,28 @@ fn convert_to_h265(
 
     octx.write_header()?;
 
+    // Calculate frame skip ratio for FPS decimation
+    let input_fps = if frame_rate.1 > 0 {
+        frame_rate.0 as f64 / frame_rate.1 as f64
+    } else {
+        30.0 // Default assumption
+    };
+
+    let frame_skip_ratio = if let Some(target_fps) = target_fps {
+        validate_fps(target_fps, input_fps)?;
+        println!(
+            "FPS decimation: {:.2} fps -> {:.2} fps (keeping ~1 in every {:.1} frames)",
+            input_fps,
+            target_fps,
+            input_fps / target_fps
+        );
+        input_fps / target_fps
+    } else {
+        1.0 // No skipping
+    };
+
     let mut frame_count: usize = 0;
+    let mut output_frame_count: usize = 0;
     let mut decoded_frame = ffmpeg::frame::Video::empty();
     let mut scaled_frame = ffmpeg::frame::Video::empty();
 
@@ -364,6 +472,18 @@ fn convert_to_h265(
         decoder.send_packet(&packet)?;
 
         while decoder.receive_frame(&mut decoded_frame).is_ok() {
+            // FPS decimation: skip frames based on ratio
+            if frame_skip_ratio > 1.0 {
+                let should_keep_frame = (frame_count as f64 / frame_skip_ratio)
+                    - (output_frame_count as f64)
+                    >= -0.0001; // Small epsilon for floating point comparison
+                frame_count += 1;
+
+                if !should_keep_frame {
+                    continue; // Skip this frame
+                }
+            }
+
             // Scale if needed, otherwise use decoded frame directly
             let frame_to_encode = if let Some(ref mut scaler) = scaler {
                 scaler.run(&decoded_frame, &mut scaled_frame)?;
@@ -383,11 +503,11 @@ fn convert_to_h265(
                 encoded_packet.write_interleaved(&mut octx)?;
             }
 
-            frame_count += 1;
+            output_frame_count += 1;
 
             // Report progress
             if let Some(ref cb) = progress {
-                cb(frame_count as u64, estimated_frames);
+                cb(output_frame_count as u64, estimated_frames);
             }
         }
     }
@@ -395,6 +515,17 @@ fn convert_to_h265(
     // Flush decoder
     decoder.send_eof()?;
     while decoder.receive_frame(&mut decoded_frame).is_ok() {
+        // FPS decimation: skip frames based on ratio
+        if frame_skip_ratio > 1.0 {
+            let should_keep_frame =
+                (frame_count as f64 / frame_skip_ratio) - (output_frame_count as f64) >= -0.0001;
+            frame_count += 1;
+
+            if !should_keep_frame {
+                continue; // Skip this frame
+            }
+        }
+
         let frame_to_encode = if let Some(ref mut scaler) = scaler {
             scaler.run(&decoded_frame, &mut scaled_frame)?;
             scaled_frame.set_pts(decoded_frame.pts());
@@ -412,9 +543,9 @@ fn convert_to_h265(
             encoded_packet.write_interleaved(&mut octx)?;
         }
 
-        frame_count += 1;
+        output_frame_count += 1;
         if let Some(ref cb) = progress {
-            cb(frame_count as u64, estimated_frames);
+            cb(output_frame_count as u64, estimated_frames);
         }
     }
 
@@ -429,7 +560,7 @@ fn convert_to_h265(
 
     octx.write_trailer()?;
 
-    Ok(frame_count)
+    Ok(output_frame_count)
 }
 
 //=============================================================================
@@ -525,6 +656,8 @@ async fn convert_single_file(
     storage_url: Option<&str>,
     force: bool,
     gpu: bool,
+    downscale: Option<u32>,
+    fps: Option<f64>,
 ) -> Result<ConvertResult> {
     // Validate input file
     validate_input(input).context("Input validation failed")?;
@@ -566,7 +699,14 @@ async fn convert_single_file(
 
     // Run transcoding in blocking task
     let frame_count = tokio::task::spawn_blocking(move || {
-        convert_to_h265(&input_clone, &output_clone, gpu, progress_cb)
+        convert_to_h265(
+            &input_clone,
+            &output_clone,
+            gpu,
+            downscale,
+            fps,
+            progress_cb,
+        )
     })
     .await
     .context("Transcoding task panicked")??;
@@ -614,6 +754,8 @@ async fn run_batch(
     storage_url: Option<&str>,
     force: bool,
     gpu: bool,
+    downscale: Option<u32>,
+    fps: Option<f64>,
 ) -> Result<BatchSummary> {
     // Find all .mp4 files
     let mp4_files = find_mp4_files(input_dir)?;
@@ -680,6 +822,8 @@ async fn run_batch(
             storage_url,
             force,
             gpu,
+            downscale,
+            fps,
         )
         .await
         {
@@ -778,6 +922,8 @@ pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
             args.storage_url.as_deref(),
             args.force,
             args.gpu,
+            args.downscale,
+            args.fps,
         )
         .await?;
 
@@ -795,6 +941,8 @@ pub async fn run(global: &crate::GlobalOpts, args: ConvertArgs) -> Result<()> {
             args.storage_url.as_deref(),
             args.force,
             args.gpu,
+            args.downscale,
+            args.fps,
         )
         .await?;
 
