@@ -14,9 +14,37 @@ crates/bucket-streamer/src/pipeline/avio.rs     # AVIOContext implementation
 crates/bucket-streamer/src/pipeline/mod.rs      # Export avio module
 ```
 
+## Pre-requisites
+
+### Generate Test Video
+Before running tests, you need an H.265 test video. Run the converter from Task 03:
+
+```bash
+# Option 1: Convert an existing video
+cargo run -p repo-cli -- convert -i /path/to/source/video.mp4 -o data/test.h265.mp4
+
+# Option 2: If you have a test video URL
+curl -o /tmp/sample.mp4 "https://example.com/sample.mp4"
+cargo run -p repo-cli -- convert -i /tmp/sample.mp4 -o data/test.h265.mp4
+```
+
+Verify the output:
+```bash
+ffprobe data/test.h265.mp4 2>&1 | grep "Video:"
+# Should show: hevc (Main) ... 
+```
+
 ## Steps
 
-### 1. Update pipeline/mod.rs
+### 1. Add libc dependency
+
+Add `libc` to `crates/bucket-streamer/Cargo.toml` under `[dependencies]`:
+
+```toml
+libc = "0.2"
+```
+
+### 2. Update pipeline/mod.rs
 
 ```rust
 pub mod avio;
@@ -26,7 +54,7 @@ pub mod fetcher;
 pub mod session;
 ```
 
-### 2. Implement pipeline/avio.rs
+### 3. Implement pipeline/avio.rs
 
 ```rust
 use bytes::Bytes;
@@ -129,7 +157,7 @@ unsafe extern "C" fn seek_packet(
 pub struct AvioContext {
     ctx: *mut AVIOContext,
     io: Box<InMemoryIO>,  // Must outlive ctx
-    _buffer: *mut u8,      // Owned by ctx, freed when ctx is freed
+    _buffer: *mut u8,      // Stored for reference; freed by avio_context_free in Drop
 }
 
 impl AvioContext {
@@ -255,7 +283,9 @@ pub unsafe fn open_format_context(
 }
 ```
 
-### 3. Create spike test
+### 4. Create spike test
+
+> **Note:** The test uses `ffmpeg_next::init()` which must be called before any FFmpeg operations. The main implementation uses `ffmpeg_sys_next` directly for low-level control.
 
 ```rust
 #[cfg(test)]
@@ -327,7 +357,7 @@ mod tests {
 }
 ```
 
-### 4. Document memory management
+### 5. Document memory management
 
 Key lifetime requirements:
 1. `InMemoryIO` (via Box) must outlive `AVIOContext`
